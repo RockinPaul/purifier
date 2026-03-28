@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/purifier-core", "crates/purifier-tui"]
+resolver = "2"
