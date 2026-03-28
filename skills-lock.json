@@ -1,0 +1,140 @@
+{
+  "version": 1,
+  "skills": {
+    "blogwatcher": {
+      "source": "/Users/pavelzarudnev/.agents/skills",
+      "sourceType": "local",
+      "computedHash": "f74dd900af73d9e8887dde74d939a59b65229b6d05bf6abfcdaa0508e08fad8c"
+    },
+    "brainstorming": {
+      "source": "/Users/pavelzarudnev/.agents/skills",
+      "sourceType": "local",
+      "computedHash": "8df9b47092524833138b58682d03f2e153a242e550d1693657afdbee0cc9cdb0"
+    },
+    "canvas-design": {
+      "source": "/Users/pavelzarudnev/.agents/skills",
+      "sourceType": "local",
+      "computedHash": "a2fe47d24b3fd8e52faef731fff099c557e698083cd644b2e5695cc4dd8c7715"
+    },
+    "design-md": {
+      "source": "/Users/pavelzarudnev/.agents/skills",
+      "sourceType": "local",
+      "computedHash": "d3a4c7d2f2715a33662c8b06ffc16035d01965a8b4ed81c2958fb22ae94760f8"
+    },
+    "dispatching-parallel-agents": {
+      "source": "/Users/pavelzarudnev/.agents/skills",
+      "sourceType": "local",
+      "computedHash": "e21044ae7496fc285f1df9ff3fb518a3a20bea6f5216c1f59f4987e12c769a0a"
+    },
+    "enhance-prompt": {
+      "source": "/Users/pavelzarudnev/.agents/skills",
+      "sourceType": "local",
+      "computedHash": "71cc23e9ec5fc6361e12453495fa8c683f6cf26f3efaf9b230b0f43e0a32cc96"
+    },
+    "executing-plans": {
+      "source": "/Users/pavelzarudnev/.agents/skills",
+      "sourceType": "local",
+      "computedHash": "2f709d1a2c7564f8ce6a9bb707e7f5451117ba80f8e8e2302662c29bc61246a6"
+    },
+    "find-skills": {
+      "source": "/Users/pavelzarudnev/.agents/skills",
+      "sourceType": "local",
+      "computedHash": "d31e234f0c90694a670222cdd1dafa853e051d7066beda389f1097c22dadd461"
+    },
+    "finishing-a-development-branch": {
+      "source": "/Users/pavelzarudnev/.agents/skills",
+      "sourceType": "local",
+      "computedHash": "9edba9a38684c060fdc38290f640e1dc0c37de286723ac9be73bacacf7cd6f3d"
+    },
+    "frontend-design": {
+      "source": "/Users/pavelzarudnev/.agents/skills",
+      "sourceType": "local",
+      "computedHash": "063a0e6448123cd359ad0044cc46b0e490cc7964d45ef4bb9fd842bd2ffbca67"
+    },
+    "macos-spm-app-packaging": {
+      "source": "/Users/pavelzarudnev/.agents/skills",
+      "sourceType": "local",
+      "computedHash": "189e647b65a5ca77e03c9cbd57d29cfafa90e2612ae4c1fc5c5bfb34a0338d5f"
+    },
+    "receiving-code-review": {
+      "source": "/Users/pavelzarudnev/.agents/skills",
+      "sourceType": "local",
+      "computedHash": "2760c85d4f4117b0006e7ba755f4bbd61f8f4c185f347999763c97f507274e30"
+    },
+    "requesting-code-review": {
+      "source": "/Users/pavelzarudnev/.agents/skills",
+      "sourceType": "local",
+      "computedHash": "246e65cd72a7e360987d94e6c61564ce6d71c6361d1784d529d70e4cbbe8522d"
+    },
+    "stitch-design": {
+      "source": "/Users/pavelzarudnev/.agents/skills",
+      "sourceType": "local",
+      "computedHash": "1d603ab4d2aafd2982f26ca7b6620e40355176ad7e8ba9bba952b5aa86e8a003"
+    },
+    "subagent-driven-development": {
+      "source": "/Users/pavelzarudnev/.agents/skills",
+      "sourceType": "local",
+      "computedHash": "a197f8e5fba5ea59013e1adbaa90dd42db35de8f074feca200c8038de584a83b"
+    },
+    "swift-architecture-skill": {
+      "source": "/Users/pavelzarudnev/.agents/skills",
+      "sourceType": "local",
+      "computedHash": "67d3359424b19084631998def14666fd5a77284a45ac0353c41a86a7ed216923"
+    },
+    "swift-concurrency-pro": {
+      "source": "/Users/pavelzarudnev/.agents/skills",
+      "sourceType": "local",
+      "computedHash": "dec65531b4bd37d15e6243dbb0d2d1f554b4f4087bcb2e8deb7273f570fa4069"
+    },
+    "swift-testing-pro": {
+      "source": "/Users/pavelzarudnev/.agents/skills",
+      "sourceType": "local",
+      "computedHash": "90504b29146ccd7e88d8ba7244c6c4e4d2b410fb21bdd4ce578f10583b158481"
+    },
+    "swiftdata-pro": {
+      "source": "/Users/pavelzarudnev/.agents/skills",
+      "sourceType": "local",
+      "computedHash": "2f979bad98ea3a6744084c5f93e27897f02e8d0ffe15dd03042e88aaae4da14c"
+    },
+    "swiftui-pro": {
+      "source": "/Users/pavelzarudnev/.agents/skills",
+      "sourceType": "local",
+      "computedHash": "ce653d19fd00a4874489003025e9235be542e7134ff3c543e20afeb53fc3bc9a"
+    },
+    "systematic-debugging": {
+      "source": "/Users/pavelzarudnev/.agents/skills",
+      "sourceType": "local",
+      "computedHash": "72e9ab72627e4fd8ed26a582e82309a98ecdc4f6e1c99418430ac05682c9e91d"
+    },
+    "test-driven-development": {
+      "source": "/Users/pavelzarudnev/.agents/skills",
+      "sourceType": "local",
+      "computedHash": "126f1ebf6ccd414f42544f6e83d8cc5adb089e1108eaffb7c400701e37eecd9f"
+    },
+    "using-git-worktrees": {
+      "source": "/Users/pavelzarudnev/.agents/skills",
+      "sourceType": "local",
+      "computedHash": "52bbb4b6e80918e83e92a1514f3b3757712154c2a8a42de24919e48a794c54fc"
+    },
+    "using-superpowers": {
+      "source": "/Users/pavelzarudnev/.agents/skills",
+      "sourceType": "local",
+      "computedHash": "af9db85109491dbe11f36b13724835f0f03583a5e026bf496b3b257e27a3f753"
+    },
+    "verification-before-completion": {
+      "source": "/Users/pavelzarudnev/.agents/skills",
+      "sourceType": "local",
+      "computedHash": "9b446f0c7fe1cfb560b1d34439523b1a76d5f177290007b2c053a1c749a4a8ba"
+    },
+    "writing-plans": {
+      "source": "/Users/pavelzarudnev/.agents/skills",
+      "sourceType": "local",
+      "computedHash": "bfaed11054ad8021c66860244e2d2e0d1eca483ae9f5fbfcb956e99c61f5c3d7"
+    },
+    "writing-skills": {
+      "source": "/Users/pavelzarudnev/.agents/skills",
+      "sourceType": "local",
+      "computedHash": "c0a92e629e39ea91b1f54da67a6aa92723008a8ef5b500c6de078f55485937c7"
+    }
+  }
+}
