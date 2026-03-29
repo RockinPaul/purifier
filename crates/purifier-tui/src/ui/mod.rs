@@ -1,9 +1,9 @@
 pub mod dir_picker;
-pub mod tree_view;
 pub mod status_bar;
+pub mod tree_view;
 
-use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::Frame;
 
 use crate::app::{App, AppScreen, View};
 
@@ -22,7 +22,7 @@ fn draw_main(frame: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // tab bar
+            Constraint::Length(3), // tab bar
             Constraint::Min(5),    // main content
             Constraint::Length(3), // info panel
             Constraint::Length(1), // status bar
@@ -55,7 +55,13 @@ fn draw_tab_bar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .map(|(i, view)| {
             let label = format!(" {}:{} ", i + 1, view.label());
             if *view == app.current_view {
-                Span::styled(label, Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD))
+                Span::styled(
+                    label,
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )
             } else {
                 Span::styled(label, Style::default().fg(Color::DarkGray))
             }
@@ -63,13 +69,13 @@ fn draw_tab_bar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .collect();
 
     let title = format!(" purifier — {} ", app.scan_path.display());
-    let paragraph = Paragraph::new(Line::from(tabs))
-        .block(Block::default().borders(Borders::ALL).title(title));
+    let paragraph =
+        Paragraph::new(Line::from(tabs)).block(Block::default().borders(Borders::ALL).title(title));
     frame.render_widget(paragraph, area);
 }
 
 fn draw_delete_confirm(frame: &mut Frame, app: &App) {
-    use ratatui::layout::{Constraint, Layout, Flex};
+    use ratatui::layout::{Constraint, Flex, Layout};
     use ratatui::style::{Color, Style};
     use ratatui::text::{Line, Span};
     use ratatui::widgets::{Block, Borders, Clear, Paragraph};
@@ -148,5 +154,37 @@ pub fn format_size(bytes: u64) -> String {
         format!("{:.1} KB", bytes as f64 / KB as f64)
     } else {
         format!("{} B", bytes)
+    }
+}
+
+pub fn truncate_start(input: &str, max_chars: usize) -> String {
+    input.chars().take(max_chars).collect()
+}
+
+pub fn truncate_tail(input: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    if chars.len() <= max_chars {
+        return input.to_string();
+    }
+
+    let tail_len = max_chars.saturating_sub(3);
+    let tail: String = chars[chars.len().saturating_sub(tail_len)..]
+        .iter()
+        .collect();
+    format!("...{tail}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_start_should_preserve_unicode_boundaries() {
+        assert_eq!(truncate_start("a😀b😀c", 4), "a😀b😀");
+    }
+
+    #[test]
+    fn truncate_tail_should_preserve_unicode_boundaries() {
+        assert_eq!(truncate_tail("ab😀c😀d", 5), "...😀d");
     }
 }

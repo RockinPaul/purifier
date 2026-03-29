@@ -64,7 +64,7 @@ fn run_scan(root: &Path, tx: &Sender<ScanEvent>) {
                 }
 
                 counter += 1;
-                if counter % PROGRESS_INTERVAL == 0 {
+                if counter.is_multiple_of(PROGRESS_INTERVAL) {
                     let progress = ScanEvent::Progress {
                         files_scanned: total_files.load(Ordering::Relaxed),
                         bytes_found: total_size.load(Ordering::Relaxed),
@@ -111,20 +111,30 @@ mod tests {
 
         for event in rx {
             match event {
-                ScanEvent::Entry { path, size, is_dir, .. } => {
+                ScanEvent::Entry {
+                    path, size, is_dir, ..
+                } => {
                     entries.push((path, size, is_dir));
                 }
                 ScanEvent::Progress { .. } => {
                     // Progress events are fine, just skip in this test
                 }
-                ScanEvent::ScanComplete { total_size, total_files, skipped } => {
+                ScanEvent::ScanComplete {
+                    total_size,
+                    total_files,
+                    skipped,
+                } => {
                     complete = Some((total_size, total_files, skipped));
                 }
             }
         }
 
         // Should have: root dir, file1.txt, file2.txt, subdir, subdir/nested.txt
-        assert!(entries.len() >= 4, "Expected at least 4 entries, got {}", entries.len());
+        assert!(
+            entries.len() >= 4,
+            "Expected at least 4 entries, got {}",
+            entries.len()
+        );
 
         let (total_size, _total_files, skipped) = complete.expect("Should receive ScanComplete");
         // file1.txt=5 + file2.txt=6 + nested.txt=14 = 25

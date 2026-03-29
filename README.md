@@ -90,7 +90,7 @@ Purifier ships with ~30 macOS-specific rules in `rules/default.toml` covering:
 Rules are evaluated top-to-bottom, first match wins. Add your own rules via `--rules my-rules.toml`.
 
 ### LLM fallback
-Paths not matched by any rule are batched (up to 50 at a time) and sent to OpenRouter for classification. The LLM returns a category, safety level, and one-line explanation for each path. Results are cached for the session.
+Paths not matched by any rule are batched (up to 50 at a time) and sent to OpenRouter for classification. The LLM returns a category, safety level, and one-line explanation for each path.
 
 If the LLM is unavailable, unmatched paths stay "Unknown" — the tool is fully usable without an API key.
 
@@ -147,9 +147,9 @@ Two-crate workspace:
 
 ```bash
 cargo build            # debug build
-cargo test             # run all tests (7 unit tests)
+cargo test             # run all tests (28 unit tests)
 cargo run -- ~/tmp     # quick test scan
-cargo clippy           # lint
+cargo clippy --all-targets --all-features --locked -- -D warnings
 ```
 
 ## Platform support

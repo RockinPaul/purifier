@@ -1,11 +1,11 @@
-use ratatui::layout::{Flex, Rect, Layout, Constraint};
+use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 use ratatui::Frame;
 
+use super::{format_size, truncate_start, truncate_tail};
 use crate::app::{App, ScanStatus};
-use super::format_size;
 
 pub fn draw(frame: &mut Frame, app: &App, main_area: Rect, info_area: Rect) {
     // During scanning with no entries yet, show a progress screen
@@ -21,16 +21,28 @@ pub fn draw(frame: &mut Frame, app: &App, main_area: Rect, info_area: Rect) {
         .map(|(i, entry)| {
             let indent = "  ".repeat(entry.depth);
             let icon = if entry.is_dir {
-                if entry.expanded { "▼ " } else { "▶ " }
+                if entry.expanded {
+                    "▼ "
+                } else {
+                    "▶ "
+                }
             } else {
                 "  "
             };
 
             let safety_badge = match entry.safety {
-                purifier_core::SafetyLevel::Safe => Span::styled(" ✓ ", Style::default().fg(Color::Green)),
-                purifier_core::SafetyLevel::Caution => Span::styled(" ⚠ ", Style::default().fg(Color::Yellow)),
-                purifier_core::SafetyLevel::Unsafe => Span::styled(" ✗ ", Style::default().fg(Color::Red)),
-                purifier_core::SafetyLevel::Unknown => Span::styled(" ? ", Style::default().fg(Color::DarkGray)),
+                purifier_core::SafetyLevel::Safe => {
+                    Span::styled(" ✓ ", Style::default().fg(Color::Green))
+                }
+                purifier_core::SafetyLevel::Caution => {
+                    Span::styled(" ⚠ ", Style::default().fg(Color::Yellow))
+                }
+                purifier_core::SafetyLevel::Unsafe => {
+                    Span::styled(" ✗ ", Style::default().fg(Color::Red))
+                }
+                purifier_core::SafetyLevel::Unknown => {
+                    Span::styled(" ? ", Style::default().fg(Color::DarkGray))
+                }
             };
 
             let name = entry
@@ -41,29 +53,26 @@ pub fn draw(frame: &mut Frame, app: &App, main_area: Rect, info_area: Rect) {
 
             let size_str = format_size(entry.size);
 
-            let max_size = app
-                .flat_entries
-                .first()
-                .map(|e| e.size)
-                .unwrap_or(1)
-                .max(1);
+            let max_size = app.flat_entries.first().map(|e| e.size).unwrap_or(1).max(1);
             let bar_width = 15;
             let filled = ((entry.size as f64 / max_size as f64) * bar_width as f64) as usize;
             let bar: String = "█".repeat(filled) + &"░".repeat(bar_width - filled);
 
             let style = if i == app.selected_index {
-                Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
 
             let line = Line::from(vec![
                 Span::raw(format!("{indent}{icon}")),
+                Span::styled(format!("{:<30}", truncate_start(&name, 30)), style),
                 Span::styled(
-                    format!("{:<30}", if name.len() > 30 { &name[..30] } else { &name }),
-                    style,
+                    format!(" {:<10}", size_str),
+                    Style::default().fg(Color::Cyan),
                 ),
-                Span::styled(format!(" {:<10}", size_str), Style::default().fg(Color::Cyan)),
                 Span::styled(bar, Style::default().fg(Color::Blue)),
                 safety_badge,
             ]);
@@ -85,25 +94,24 @@ pub fn draw(frame: &mut Frame, app: &App, main_area: Rect, info_area: Rect) {
         "No selection".to_string()
     };
 
-    let info = Paragraph::new(info_text)
-        .block(Block::default().borders(Borders::ALL).title(" Info "));
+    let info =
+        Paragraph::new(info_text).block(Block::default().borders(Borders::ALL).title(" Info "));
     frame.render_widget(info, info_area);
 }
 
 fn draw_scanning(frame: &mut Frame, app: &App, main_area: Rect, info_area: Rect) {
     let vertical = Layout::vertical([Constraint::Length(8)]).flex(Flex::Center);
-    let horizontal =
-        Layout::horizontal([Constraint::Length(50.min(main_area.width.saturating_sub(4)))])
-            .flex(Flex::Center);
+    let horizontal = Layout::horizontal([Constraint::Length(
+        50.min(main_area.width.saturating_sub(4)),
+    )])
+    .flex(Flex::Center);
     let [center_v] = vertical.areas(main_area);
     let [center] = horizontal.areas(center_v);
 
-    let dir_display = if app.current_scan_dir.len() > 45 {
-        format!("...{}", &app.current_scan_dir[app.current_scan_dir.len() - 42..])
-    } else if app.current_scan_dir.is_empty() {
+    let dir_display = if app.current_scan_dir.is_empty() {
         "starting...".to_string()
     } else {
-        app.current_scan_dir.clone()
+        truncate_tail(&app.current_scan_dir, 45)
     };
 
     let lines = vec![
@@ -135,7 +143,7 @@ fn draw_scanning(frame: &mut Frame, app: &App, main_area: Rect, info_area: Rect)
         ]),
         Line::from(""),
         Line::from(Span::styled(
-            "  Press q to cancel",
+            "  Press q to quit",
             Style::default().fg(Color::DarkGray),
         )),
     ];

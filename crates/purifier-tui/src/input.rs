@@ -1,5 +1,4 @@
 use crossterm::event::{KeyCode, KeyEvent};
-use purifier_core::types::FileEntry;
 
 use crate::app::{App, AppScreen, View};
 
@@ -67,9 +66,9 @@ fn handle_custom_input(app: &mut App, key: KeyEvent) -> InputResult {
                 app.dir_picker_typing = false;
                 return InputResult::None;
             }
-            let path = if raw.starts_with("~/") {
+            let path = if let Some(stripped) = raw.strip_prefix("~/") {
                 if let Some(home) = dirs::home_dir() {
-                    home.join(&raw[2..])
+                    home.join(stripped)
                 } else {
                     std::path::PathBuf::from(&raw)
                 }
@@ -136,15 +135,20 @@ fn handle_delete_confirm(app: &mut App, key: KeyEvent) {
                 match purifier_core::delete_entry(&flat.path) {
                     Ok(freed) => {
                         app.freed_space += freed;
-                        let index_path = flat.entry_index.clone();
-                        remove_entry(&mut app.entries, &index_path);
+                        app.last_error = None;
+                        app.mark_deleted(&flat.path);
+                        app.remove_entry_by_path(&flat.path);
                         app.rebuild_flat_entries();
-                        if app.selected_index >= app.flat_entries.len() && !app.flat_entries.is_empty()
+                        if app.selected_index >= app.flat_entries.len()
+                            && !app.flat_entries.is_empty()
                         {
                             app.selected_index = app.flat_entries.len() - 1;
                         }
                     }
-                    Err(_e) => {}
+                    Err(error) => {
+                        app.last_error =
+                            Some(format!("Could not delete {}: {error}", flat.path.display()));
+                    }
                 }
             }
             app.show_delete_confirm = false;
@@ -156,17 +160,41 @@ fn handle_delete_confirm(app: &mut App, key: KeyEvent) {
     }
 }
 
-fn remove_entry(entries: &mut Vec<FileEntry>, index_path: &[usize]) {
-    if index_path.is_empty() {
-        return;
-    }
-    if index_path.len() == 1 {
-        if index_path[0] < entries.len() {
-            entries.remove(index_path[0]);
-        }
-        return;
-    }
-    if let Some(parent) = entries.get_mut(index_path[0]) {
-        remove_entry(&mut parent.children, &index_path[1..]);
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use purifier_core::types::FileEntry;
+
+    use super::handle_key;
+    use crate::app::App;
+
+    #[test]
+    fn confirm_delete_should_keep_entry_and_record_error_when_delete_fails() {
+        let mut app = App::new(Some(PathBuf::from("/")), false);
+        app.entries = vec![FileEntry::new(
+            PathBuf::from("/definitely/missing"),
+            1,
+            false,
+            None,
+        )];
+        app.rebuild_flat_entries();
+        app.show_delete_confirm = true;
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        );
+
+        assert_eq!(app.entries.len(), 1, "failed delete should keep entry");
+        assert!(
+            app.last_error.is_some(),
+            "failed delete should record an error"
+        );
+        assert!(
+            !app.show_delete_confirm,
+            "confirmation should close after handling"
+        );
     }
 }

@@ -33,7 +33,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // header
-            Constraint::Min(3),   // list
+            Constraint::Min(3),    // list
             Constraint::Length(3), // custom input
             Constraint::Length(2), // help
         ])

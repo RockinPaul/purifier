@@ -4,18 +4,14 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
+use super::{format_size, truncate_tail};
 use crate::app::{App, ScanStatus};
-use super::format_size;
 
 pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     let scan_info = match app.scan_status {
         ScanStatus::Idle => Span::styled("Ready", Style::default().fg(Color::DarkGray)),
         ScanStatus::Scanning => {
-            let dir_display = if app.current_scan_dir.len() > 40 {
-                format!("...{}", &app.current_scan_dir[app.current_scan_dir.len() - 37..])
-            } else {
-                app.current_scan_dir.clone()
-            };
+            let dir_display = truncate_tail(&app.current_scan_dir, 40);
             Span::styled(
                 format!(
                     "Scanning... {} files | {} found | {}",
@@ -36,10 +32,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         ),
     };
 
-    let mut parts = vec![
-        Span::raw(" "),
-        scan_info,
-    ];
+    let mut parts = vec![Span::raw(" "), scan_info];
 
     if app.skipped > 0 {
         parts.push(Span::styled(
@@ -52,6 +45,13 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         parts.push(Span::styled(
             format!(" | Freed: {}", format_size(app.freed_space)),
             Style::default().fg(Color::Green),
+        ));
+    }
+
+    if let Some(error) = &app.last_error {
+        parts.push(Span::styled(
+            format!(" | Error: {error}"),
+            Style::default().fg(Color::Red),
         ));
     }
 
@@ -69,7 +69,6 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(Color::DarkGray),
     ));
 
-    let status = Paragraph::new(Line::from(parts))
-        .style(Style::default().bg(Color::Black));
+    let status = Paragraph::new(Line::from(parts)).style(Style::default().bg(Color::Black));
     frame.render_widget(status, area);
 }

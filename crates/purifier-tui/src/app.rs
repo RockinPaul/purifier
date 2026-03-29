@@ -1,8 +1,15 @@
-use std::path::PathBuf;
+use std::cmp::{Ordering, Reverse};
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use purifier_core::types::{Category, FileEntry, SafetyLevel};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "Tab names intentionally mirror the user-visible By Size/By Type/By Safety/By Age labels"
+)]
 pub enum View {
     BySize,
     ByType,
@@ -47,6 +54,9 @@ pub struct App {
     pub scan_path: PathBuf,
     pub should_quit: bool,
     pub show_delete_confirm: bool,
+    pub last_error: Option<String>,
+    pub expanded_paths: HashSet<PathBuf>,
+    pub deleted_paths: HashSet<PathBuf>,
     pub llm_enabled: bool,
     pub llm_online: bool,
     pub flat_entries: Vec<FlatEntry>,
@@ -64,11 +74,11 @@ pub struct App {
 #[derive(Debug, Clone)]
 pub struct FlatEntry {
     pub depth: usize,
-    pub entry_index: Vec<usize>, // path through the tree
     pub path: PathBuf,
     pub size: u64,
     pub is_dir: bool,
     pub expanded: bool,
+    pub modified: Option<SystemTime>,
     pub category: Category,
     pub safety: SafetyLevel,
     pub safety_reason: String,
@@ -97,6 +107,9 @@ impl App {
             scan_path: scan_path.unwrap_or_else(|| PathBuf::from("/")),
             should_quit: false,
             show_delete_confirm: false,
+            last_error: None,
+            expanded_paths: HashSet::new(),
+            deleted_paths: HashSet::new(),
             llm_enabled,
             llm_online: false,
             flat_entries: Vec::new(),
@@ -117,6 +130,8 @@ impl App {
         self.files_scanned = 0;
         self.bytes_found = 0;
         self.current_scan_dir.clear();
+        self.expanded_paths.clear();
+        self.deleted_paths.clear();
     }
 
     pub fn switch_view(&mut self, view: View) {
@@ -145,9 +160,14 @@ impl App {
     pub fn toggle_expand(&mut self) {
         if let Some(flat) = self.flat_entries.get(self.selected_index) {
             if flat.is_dir {
-                let index_path = flat.entry_index.clone();
-                if let Some(entry) = self.get_entry_mut(&index_path) {
+                let path = flat.path.clone();
+                if let Some(entry) = self.get_entry_mut_by_path(&path) {
                     entry.expanded = !entry.expanded;
+                    if entry.expanded {
+                        self.expanded_paths.insert(path.clone());
+                    } else {
+                        self.expanded_paths.remove(&path);
+                    }
                 }
                 self.rebuild_flat_entries();
             }
@@ -158,15 +178,50 @@ impl App {
         self.flat_entries.get(self.selected_index)
     }
 
-    fn get_entry_mut(&mut self, index_path: &[usize]) -> Option<&mut FileEntry> {
-        if index_path.is_empty() {
-            return None;
+    pub fn remove_entry_by_path(&mut self, path: &Path) -> bool {
+        fn remove_entry(entries: &mut Vec<FileEntry>, path: &Path) -> bool {
+            if let Some(index) = entries.iter().position(|entry| entry.path == path) {
+                entries.remove(index);
+                return true;
+            }
+
+            for entry in entries {
+                if remove_entry(&mut entry.children, path) {
+                    return true;
+                }
+            }
+
+            false
         }
-        let mut current = self.entries.get_mut(index_path[0])?;
-        for &idx in &index_path[1..] {
-            current = current.children.get_mut(idx)?;
+
+        remove_entry(&mut self.entries, path)
+    }
+
+    pub fn mark_deleted(&mut self, path: &Path) {
+        self.deleted_paths.insert(path.to_path_buf());
+        self.expanded_paths
+            .retain(|expanded| !expanded.starts_with(path));
+    }
+
+    fn get_entry_mut_by_path(&mut self, path: &Path) -> Option<&mut FileEntry> {
+        fn find_entry_mut<'a>(
+            entries: &'a mut [FileEntry],
+            path: &Path,
+        ) -> Option<&'a mut FileEntry> {
+            for entry in entries {
+                if entry.path == path {
+                    return Some(entry);
+                }
+
+                if let Some(found) = find_entry_mut(&mut entry.children, path) {
+                    return Some(found);
+                }
+            }
+
+            None
         }
-        Some(current)
+
+        find_entry_mut(&mut self.entries, path)
     }
 
     pub fn rebuild_flat_entries(&mut self) {
@@ -175,41 +230,38 @@ impl App {
             View::BySize => self.flatten_by_size(),
             View::ByType => self.flatten_by_group(|e| e.category),
             View::BySafety => self.flatten_by_group(|e| e.safety),
-            View::ByAge => self.flatten_by_size(),
+            View::ByAge => self.flatten_by_age(),
         }
     }
 
     fn flatten_by_size(&mut self) {
         let mut sorted = self.entries.clone();
-        sorted.sort_by(|a, b| b.total_size().cmp(&a.total_size()));
+        sorted.sort_by_key(|entry| Reverse(entry.total_size()));
 
-        for (i, entry) in sorted.iter().enumerate() {
-            self.flatten_entry(entry, 0, vec![i]);
+        for entry in &sorted {
+            self.flatten_entry(entry, 0);
         }
     }
 
-    fn flatten_entry(&mut self, entry: &FileEntry, depth: usize, index_path: Vec<usize>) {
+    fn flatten_entry(&mut self, entry: &FileEntry, depth: usize) {
         self.flat_entries.push(FlatEntry {
             depth,
-            entry_index: index_path.clone(),
             path: entry.path.clone(),
             size: entry.total_size(),
             is_dir: entry.is_dir,
             expanded: entry.expanded,
+            modified: entry.modified,
             category: entry.category,
             safety: entry.safety,
             safety_reason: entry.safety_reason.clone(),
         });
 
         if entry.expanded {
-            let mut children: Vec<(usize, &FileEntry)> =
-                entry.children.iter().enumerate().collect();
-            children.sort_by(|a, b| b.1.total_size().cmp(&a.1.total_size()));
+            let mut children: Vec<&FileEntry> = entry.children.iter().collect();
+            children.sort_by_key(|entry| Reverse(entry.total_size()));
 
-            for (child_idx, child) in children {
-                let mut child_path = index_path.clone();
-                child_path.push(child_idx);
-                self.flatten_entry(child, depth + 1, child_path);
+            for child in children {
+                self.flatten_entry(child, depth + 1);
             }
         }
     }
@@ -218,11 +270,11 @@ impl App {
         let mut all_flat = Vec::new();
         let sorted = {
             let mut s = self.entries.clone();
-            s.sort_by(|a, b| b.total_size().cmp(&a.total_size()));
+            s.sort_by_key(|entry| Reverse(entry.total_size()));
             s
         };
-        for (i, entry) in sorted.iter().enumerate() {
-            Self::collect_flat(entry, 0, vec![i], &mut all_flat);
+        for entry in &sorted {
+            Self::collect_flat(entry, 0, &mut all_flat);
         }
 
         all_flat.sort_by(|a, b| {
@@ -234,28 +286,39 @@ impl App {
         self.flat_entries = all_flat;
     }
 
-    fn collect_flat(
-        entry: &FileEntry,
-        depth: usize,
-        index_path: Vec<usize>,
-        out: &mut Vec<FlatEntry>,
-    ) {
+    fn flatten_by_age(&mut self) {
+        let mut all_flat = Vec::new();
+        for entry in &self.entries {
+            Self::collect_flat(entry, 0, &mut all_flat);
+        }
+
+        all_flat.sort_by(|a, b| match (a.modified, b.modified) {
+            (Some(a_modified), Some(b_modified)) => {
+                a_modified.cmp(&b_modified).then(b.size.cmp(&a.size))
+            }
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => b.size.cmp(&a.size),
+        });
+
+        self.flat_entries = all_flat;
+    }
+
+    fn collect_flat(entry: &FileEntry, depth: usize, out: &mut Vec<FlatEntry>) {
         out.push(FlatEntry {
             depth,
-            entry_index: index_path.clone(),
             path: entry.path.clone(),
             size: entry.total_size(),
             is_dir: entry.is_dir,
             expanded: entry.expanded,
+            modified: entry.modified,
             category: entry.category,
             safety: entry.safety,
             safety_reason: entry.safety_reason.clone(),
         });
 
-        for (child_idx, child) in entry.children.iter().enumerate() {
-            let mut child_path = index_path.clone();
-            child_path.push(child_idx);
-            Self::collect_flat(child, depth + 1, child_path, out);
+        for child in &entry.children {
+            Self::collect_flat(child, depth + 1, out);
         }
     }
 }
@@ -283,4 +346,101 @@ fn build_dir_picker_options() -> Vec<PathBuf> {
     }
 
     options
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    fn dir(path: &str, size: u64) -> FileEntry {
+        FileEntry::new(PathBuf::from(path), size, true, None)
+    }
+
+    fn file(path: &str, size: u64, modified: Option<SystemTime>) -> FileEntry {
+        FileEntry::new(PathBuf::from(path), size, false, modified)
+    }
+
+    #[test]
+    fn toggle_expand_should_target_selected_path_when_entries_are_size_sorted() {
+        let mut app = App::new(Some(PathBuf::from("/")), false);
+        app.entries = vec![dir("/small", 10), dir("/large", 20)];
+        app.rebuild_flat_entries();
+
+        assert_eq!(
+            app.selected_entry().map(|entry| entry.path.as_path()),
+            Some(PathBuf::from("/large").as_path())
+        );
+
+        app.toggle_expand();
+
+        assert!(!app.entries[0].expanded, "small should stay collapsed");
+        assert!(app.entries[1].expanded, "large should expand");
+    }
+
+    #[test]
+    fn remove_entry_by_path_should_remove_selected_path_when_entries_are_size_sorted() {
+        let mut app = App::new(Some(PathBuf::from("/")), false);
+        app.entries = vec![dir("/small", 10), dir("/large", 20)];
+        app.rebuild_flat_entries();
+
+        let selected_path = app
+            .selected_entry()
+            .map(|entry| entry.path.clone())
+            .expect("selected entry should exist");
+
+        assert!(app.remove_entry_by_path(&selected_path));
+        assert_eq!(app.entries.len(), 1, "one entry should remain");
+        assert_eq!(app.entries[0].path, PathBuf::from("/small"));
+    }
+
+    #[test]
+    fn age_view_should_sort_oldest_first_and_put_missing_timestamps_last() {
+        let older = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let newer = SystemTime::UNIX_EPOCH + Duration::from_secs(20);
+        let mut app = App::new(Some(PathBuf::from("/")), false);
+        app.entries = vec![
+            file("/none", 5, None),
+            file("/newer", 5, Some(newer)),
+            file("/older", 5, Some(older)),
+        ];
+
+        app.switch_view(View::ByAge);
+
+        let paths: Vec<PathBuf> = app
+            .flat_entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/older"),
+                PathBuf::from("/newer"),
+                PathBuf::from("/none"),
+            ]
+        );
+    }
+
+    #[test]
+    fn age_view_should_use_size_as_tiebreaker_for_matching_timestamps() {
+        let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let mut app = App::new(Some(PathBuf::from("/")), false);
+        app.entries = vec![
+            file("/small", 10, Some(modified)),
+            file("/large", 20, Some(modified)),
+        ];
+
+        app.switch_view(View::ByAge);
+
+        let paths: Vec<PathBuf> = app
+            .flat_entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![PathBuf::from("/large"), PathBuf::from("/small")]
+        );
+    }
 }

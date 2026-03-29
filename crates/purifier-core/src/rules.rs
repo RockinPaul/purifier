@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -61,10 +62,13 @@ impl RulesEngine {
     }
 
     pub fn classify(&self, path: &Path) -> Option<RuleMatch> {
-        let path_str = path.to_string_lossy();
+        let normalized_path = normalize_for_matching(path);
+        let path_str = normalized_path.to_string_lossy();
 
         for rule in &self.rules {
-            if rule.pattern.matches(&path_str) || matches_any_ancestor(path, &rule.pattern) {
+            if rule.pattern.matches(&path_str)
+                || matches_any_ancestor(normalized_path.as_ref(), &rule.pattern)
+            {
                 return Some(RuleMatch {
                     category: rule.category,
                     safety: rule.safety,
@@ -74,6 +78,18 @@ impl RulesEngine {
         }
 
         None
+    }
+}
+
+fn normalize_for_matching(path: &Path) -> Cow<'_, Path> {
+    if path.is_absolute() {
+        Cow::Borrowed(path)
+    } else if let Ok(canonical) = path.canonicalize() {
+        Cow::Owned(canonical)
+    } else if let Ok(cwd) = std::env::current_dir() {
+        Cow::Owned(cwd.join(path))
+    } else {
+        Cow::Borrowed(path)
     }
 }
 
@@ -193,5 +209,77 @@ reason = "Log file"
             .expect("should match .log");
         assert_eq!(m.category, Category::Cache);
         assert_eq!(m.safety, SafetyLevel::Safe);
+    }
+
+    #[test]
+    fn test_relative_paths_match_absolute_rules_after_normalization() {
+        let cwd = std::env::current_dir().unwrap();
+        let dir = tempfile::tempdir_in(&cwd).unwrap();
+        let cache_dir = dir.path().join("cache");
+        fs::create_dir(&cache_dir).unwrap();
+
+        let rules_path = dir.path().join("absolute-rules.toml");
+        fs::write(
+            &rules_path,
+            format!(
+                r#"
+[[rules]]
+pattern = "{}"
+category = "Cache"
+safety = "Safe"
+reason = "Absolute cache path"
+"#,
+                cache_dir.display()
+            ),
+        )
+        .unwrap();
+
+        let relative_cache = cache_dir.strip_prefix(&cwd).unwrap();
+        let engine = RulesEngine::new(&[rules_path]).unwrap();
+
+        let m = engine
+            .classify(relative_cache)
+            .expect("relative path should match absolute rule");
+        assert_eq!(m.category, Category::Cache);
+        assert_eq!(m.safety, SafetyLevel::Safe);
+    }
+
+    #[test]
+    fn test_first_match_wins_after_relative_path_normalization() {
+        let cwd = std::env::current_dir().unwrap();
+        let dir = tempfile::tempdir_in(&cwd).unwrap();
+        let cache_dir = dir.path().join("cache");
+        fs::create_dir(&cache_dir).unwrap();
+
+        let rules_path = dir.path().join("ordered-rules.toml");
+        fs::write(
+            &rules_path,
+            format!(
+                r#"
+[[rules]]
+pattern = "{}"
+category = "AppData"
+safety = "Unsafe"
+reason = "Specific absolute path"
+
+[[rules]]
+pattern = "**/cache"
+category = "Cache"
+safety = "Safe"
+reason = "Generic cache path"
+"#,
+                cache_dir.display()
+            ),
+        )
+        .unwrap();
+
+        let relative_cache = cache_dir.strip_prefix(&cwd).unwrap();
+        let engine = RulesEngine::new(&[rules_path]).unwrap();
+
+        let m = engine
+            .classify(relative_cache)
+            .expect("relative path should still respect first match");
+        assert_eq!(m.category, Category::AppData);
+        assert_eq!(m.safety, SafetyLevel::Unsafe);
     }
 }
