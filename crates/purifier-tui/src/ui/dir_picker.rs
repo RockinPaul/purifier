@@ -1,7 +1,7 @@
 use ratatui::layout::{Constraint, Direction, Flex, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use ratatui::Frame;
 
 use crate::app::App;
@@ -9,19 +9,31 @@ use crate::app::App;
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
 
-    // Center the picker
-    let vertical = Layout::vertical([Constraint::Length(app.dir_picker_options.len() as u16 + 8)])
-        .flex(Flex::Center);
-    let horizontal = Layout::horizontal([Constraint::Length(60.min(area.width.saturating_sub(4)))])
-        .flex(Flex::Center);
-    let [center_v] = vertical.areas(area);
+    // Clear the entire screen first
+    frame.render_widget(Clear, area);
+
+    // Full-screen outer block
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(" purifier — disk cleanup with safety intelligence ")
+        .style(Style::default().fg(Color::Cyan));
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+
+    // Center the picker content
+    let picker_height = app.dir_picker_options.len() as u16 + 10;
+    let vertical = Layout::vertical([Constraint::Length(picker_height)]).flex(Flex::Center);
+    let horizontal =
+        Layout::horizontal([Constraint::Length(56.min(inner.width.saturating_sub(2)))])
+            .flex(Flex::Center);
+    let [center_v] = vertical.areas(inner);
     let [center] = horizontal.areas(center_v);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),  // header
-            Constraint::Min(3),    // list
+            Constraint::Length(3), // header
+            Constraint::Min(3),   // list
             Constraint::Length(3), // custom input
             Constraint::Length(2), // help
         ])
@@ -29,16 +41,12 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     // Header
     let header = Paragraph::new(vec![
-        Line::from(Span::styled(
-            "  purifier",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )),
         Line::from(""),
         Line::from(Span::styled(
             "  Choose a directory to scan:",
-            Style::default().fg(Color::White),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         )),
     ]);
     frame.render_widget(header, chunks[0]);
@@ -50,6 +58,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
         .enumerate()
         .map(|(i, path)| {
             let label = shorten_path(path);
+            let marker = if i == app.dir_picker_selected && !app.dir_picker_typing {
+                " > "
+            } else {
+                "   "
+            };
             let style = if i == app.dir_picker_selected && !app.dir_picker_typing {
                 Style::default()
                     .fg(Color::Black)
@@ -58,11 +71,16 @@ pub fn draw(frame: &mut Frame, app: &App) {
             } else {
                 Style::default().fg(Color::White)
             };
-            ListItem::new(Line::from(Span::styled(format!("  {label}"), style)))
+            ListItem::new(Line::from(Span::styled(format!("{marker}{label}"), style)))
         })
         .collect();
 
-    let list = List::new(items).block(Block::default().borders(Borders::LEFT | Borders::RIGHT));
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Directories ")
+            .border_style(Style::default().fg(Color::DarkGray)),
+    );
     frame.render_widget(list, chunks[1]);
 
     // Custom path input
@@ -75,25 +93,29 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let input_label = if app.dir_picker_typing {
         format!("  > {}_", app.dir_picker_custom)
     } else if app.dir_picker_custom.is_empty() {
-        "  Or type a custom path...".to_string()
+        "  Press / to type a custom path...".to_string()
     } else {
         format!("  > {}", app.dir_picker_custom)
     };
 
-    let input = Paragraph::new(Line::from(Span::styled(input_label, input_style)))
-        .block(Block::default().borders(Borders::ALL).title(" Custom path "));
+    let input = Paragraph::new(Line::from(Span::styled(input_label, input_style))).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Custom path ")
+            .border_style(Style::default().fg(Color::DarkGray)),
+    );
     frame.render_widget(input, chunks[2]);
 
     // Help text
     let help = Paragraph::new(Line::from(vec![
-        Span::styled(" j/k", Style::default().fg(Color::Cyan)),
-        Span::styled(" navigate  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("Enter", Style::default().fg(Color::Cyan)),
-        Span::styled(" select  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("/", Style::default().fg(Color::Cyan)),
-        Span::styled(" type path  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("q", Style::default().fg(Color::Cyan)),
-        Span::styled(" quit", Style::default().fg(Color::DarkGray)),
+        Span::styled(" j/k ", Style::default().fg(Color::Cyan)),
+        Span::styled("navigate  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("Enter ", Style::default().fg(Color::Cyan)),
+        Span::styled("select  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("/ ", Style::default().fg(Color::Cyan)),
+        Span::styled("type path  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("q ", Style::default().fg(Color::Cyan)),
+        Span::styled("quit", Style::default().fg(Color::DarkGray)),
     ]));
     frame.render_widget(help, chunks[3]);
 }

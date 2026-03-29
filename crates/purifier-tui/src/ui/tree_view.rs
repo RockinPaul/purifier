@@ -1,13 +1,19 @@
-use ratatui::layout::Rect;
+use ratatui::layout::{Flex, Rect, Layout, Constraint};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 use ratatui::Frame;
 
-use crate::app::App;
+use crate::app::{App, ScanStatus};
 use super::format_size;
 
 pub fn draw(frame: &mut Frame, app: &App, main_area: Rect, info_area: Rect) {
+    // During scanning with no entries yet, show a progress screen
+    if app.scan_status == ScanStatus::Scanning && app.flat_entries.is_empty() {
+        draw_scanning(frame, app, main_area, info_area);
+        return;
+    }
+
     let items: Vec<ListItem> = app
         .flat_entries
         .iter()
@@ -35,7 +41,6 @@ pub fn draw(frame: &mut Frame, app: &App, main_area: Rect, info_area: Rect) {
 
             let size_str = format_size(entry.size);
 
-            // Size bar (proportional to largest entry)
             let max_size = app
                 .flat_entries
                 .first()
@@ -70,7 +75,6 @@ pub fn draw(frame: &mut Frame, app: &App, main_area: Rect, info_area: Rect) {
     let list = List::new(items).block(Block::default().borders(Borders::ALL));
     frame.render_widget(list, main_area);
 
-    // Info panel — safety reason for selected entry
     let info_text = if let Some(entry) = app.selected_entry() {
         if entry.safety_reason.is_empty() {
             format!("{}", entry.path.display())
@@ -82,6 +86,69 @@ pub fn draw(frame: &mut Frame, app: &App, main_area: Rect, info_area: Rect) {
     };
 
     let info = Paragraph::new(info_text)
+        .block(Block::default().borders(Borders::ALL).title(" Info "));
+    frame.render_widget(info, info_area);
+}
+
+fn draw_scanning(frame: &mut Frame, app: &App, main_area: Rect, info_area: Rect) {
+    let vertical = Layout::vertical([Constraint::Length(8)]).flex(Flex::Center);
+    let horizontal =
+        Layout::horizontal([Constraint::Length(50.min(main_area.width.saturating_sub(4)))])
+            .flex(Flex::Center);
+    let [center_v] = vertical.areas(main_area);
+    let [center] = horizontal.areas(center_v);
+
+    let dir_display = if app.current_scan_dir.len() > 45 {
+        format!("...{}", &app.current_scan_dir[app.current_scan_dir.len() - 42..])
+    } else if app.current_scan_dir.is_empty() {
+        "starting...".to_string()
+    } else {
+        app.current_scan_dir.clone()
+    };
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Scanning filesystem...",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Files: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{}", app.files_scanned),
+                Style::default().fg(Color::White),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  Found: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format_size(app.bytes_found),
+                Style::default().fg(Color::Cyan),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  Path:  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(dir_display, Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Press q to cancel",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    let scanning_widget = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow)),
+    );
+    frame.render_widget(scanning_widget, center);
+
+    // Still render info area (empty during scan)
+    let info = Paragraph::new("Scanning in progress...")
         .block(Block::default().borders(Borders::ALL).title(" Info "));
     frame.render_widget(info, info_area);
 }
