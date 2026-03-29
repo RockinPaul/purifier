@@ -1,10 +1,13 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
 use crossbeam_channel::{Receiver, Sender};
 use jwalk::WalkDir;
 
 use crate::types::ScanEvent;
+
+const PROGRESS_INTERVAL: u64 = 500;
 
 pub fn scan(root: &Path) -> Receiver<ScanEvent> {
     let (tx, rx) = crossbeam_channel::unbounded();
@@ -21,6 +24,8 @@ fn run_scan(root: &Path, tx: &Sender<ScanEvent>) {
     let total_size = Arc::new(AtomicU64::new(0));
     let total_files = Arc::new(AtomicU64::new(0));
     let skipped = Arc::new(AtomicU64::new(0));
+    let mut counter: u64 = 0;
+    let mut last_dir = String::new();
 
     for entry in WalkDir::new(root).skip_hidden(false).sort(false) {
         match entry {
@@ -43,6 +48,10 @@ fn run_scan(root: &Path, tx: &Sender<ScanEvent>) {
                     total_size.fetch_add(size, Ordering::Relaxed);
                 }
 
+                if is_dir {
+                    last_dir = path.display().to_string();
+                }
+
                 let event = ScanEvent::Entry {
                     path,
                     size,
@@ -51,7 +60,19 @@ fn run_scan(root: &Path, tx: &Sender<ScanEvent>) {
                 };
 
                 if tx.send(event).is_err() {
-                    return; // receiver dropped, stop scanning
+                    return;
+                }
+
+                counter += 1;
+                if counter % PROGRESS_INTERVAL == 0 {
+                    let progress = ScanEvent::Progress {
+                        files_scanned: total_files.load(Ordering::Relaxed),
+                        bytes_found: total_size.load(Ordering::Relaxed),
+                        current_dir: last_dir.clone(),
+                    };
+                    if tx.send(progress).is_err() {
+                        return;
+                    }
                 }
             }
             Err(_) => {
@@ -92,6 +113,9 @@ mod tests {
             match event {
                 ScanEvent::Entry { path, size, is_dir, .. } => {
                     entries.push((path, size, is_dir));
+                }
+                ScanEvent::Progress { .. } => {
+                    // Progress events are fine, just skip in this test
                 }
                 ScanEvent::ScanComplete { total_size, total_files, skipped } => {
                     complete = Some((total_size, total_files, skipped));

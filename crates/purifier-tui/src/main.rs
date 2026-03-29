@@ -23,11 +23,15 @@ use purifier_core::scanner;
 use purifier_core::types::{FileEntry, ScanEvent};
 
 use app::{App, ScanStatus};
+use input::InputResult;
+
+/// Max scan events to process per frame to prevent input starvation
+const MAX_EVENTS_PER_FRAME: usize = 1000;
 
 #[derive(Parser)]
 #[command(name = "purifier", about = "Disk cleanup with safety intelligence")]
 struct Cli {
-    /// Path to scan (defaults to /)
+    /// Path to scan (shows directory picker if omitted)
     path: Option<PathBuf>,
 
     /// Additional rules file
@@ -46,7 +50,6 @@ struct Cli {
 fn main() -> io::Result<()> {
     let cli = Cli::parse();
 
-    let scan_path = cli.path.unwrap_or_else(|| PathBuf::from("/"));
     let api_key = cli
         .api_key
         .or_else(|| std::env::var("OPENROUTER_API_KEY").ok());
@@ -57,9 +60,7 @@ fn main() -> io::Result<()> {
     if let Some(extra) = cli.rules {
         rule_paths.push(extra);
     }
-    // Look for default rules relative to executable or in known locations
-    let default_rules = find_default_rules();
-    if let Some(path) = default_rules {
+    if let Some(path) = find_default_rules() {
         rule_paths.push(path);
     }
 
@@ -83,14 +84,18 @@ fn main() -> io::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(scan_path.clone(), llm_enabled);
+    // If path provided via CLI, skip dir picker and start scanning immediately
+    let mut app = App::new(cli.path.clone(), llm_enabled);
 
-    // Start scanning
-    app.scan_status = ScanStatus::Scanning;
-    let rx = scanner::scan(&scan_path);
+    let mut scan_rx: Option<crossbeam_channel::Receiver<ScanEvent>> = None;
+
+    if let Some(path) = cli.path {
+        app.scan_status = ScanStatus::Scanning;
+        scan_rx = Some(scanner::scan(&path));
+    }
 
     // Main loop
-    let result = run_loop(&mut terminal, &mut app, &classifier, rx);
+    let result = run_loop(&mut terminal, &mut app, &classifier, &mut scan_rx);
 
     // Restore terminal
     disable_raw_mode()?;
@@ -104,56 +109,80 @@ fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
     classifier: &Classifier,
-    rx: crossbeam_channel::Receiver<ScanEvent>,
+    scan_rx: &mut Option<crossbeam_channel::Receiver<ScanEvent>>,
 ) -> io::Result<()> {
-    // Tree builder: path -> children map
     let mut path_children: HashMap<PathBuf, Vec<FileEntry>> = HashMap::new();
 
     loop {
         terminal.draw(|frame| ui::draw(frame, app))?;
 
-        // Drain scan events (non-blocking)
-        while let Ok(event) = rx.try_recv() {
-            match event {
-                ScanEvent::Entry {
-                    path,
-                    size,
-                    is_dir,
-                    modified,
-                } => {
-                    let mut entry = FileEntry::new(path.clone(), size, is_dir, modified);
-                    classifier.classify_entry(&mut entry);
+        // Process scan events — capped per frame to prevent input starvation
+        if let Some(rx) = scan_rx.as_ref() {
+            let mut processed = 0;
+            while processed < MAX_EVENTS_PER_FRAME {
+                match rx.try_recv() {
+                    Ok(event) => {
+                        match event {
+                            ScanEvent::Entry {
+                                path,
+                                size,
+                                is_dir,
+                                modified,
+                            } => {
+                                let mut entry =
+                                    FileEntry::new(path.clone(), size, is_dir, modified);
+                                classifier.classify_entry(&mut entry);
 
-                    if let Some(parent) = path.parent() {
-                        path_children
-                            .entry(parent.to_path_buf())
-                            .or_default()
-                            .push(entry);
-                    } else {
-                        app.entries.push(entry);
+                                if let Some(parent) = path.parent() {
+                                    path_children
+                                        .entry(parent.to_path_buf())
+                                        .or_default()
+                                        .push(entry);
+                                } else {
+                                    app.entries.push(entry);
+                                }
+                            }
+                            ScanEvent::Progress {
+                                files_scanned,
+                                bytes_found,
+                                current_dir,
+                            } => {
+                                app.files_scanned = files_scanned;
+                                app.bytes_found = bytes_found;
+                                app.current_scan_dir = current_dir;
+                            }
+                            ScanEvent::ScanComplete {
+                                total_size,
+                                total_files,
+                                skipped,
+                            } => {
+                                app.scan_status = ScanStatus::Complete;
+                                app.total_size = total_size;
+                                app.total_files = total_files;
+                                app.skipped = skipped;
+
+                                app.entries = build_tree(&app.scan_path, &mut path_children);
+                                app.rebuild_flat_entries();
+                            }
+                        }
+                        processed += 1;
                     }
-                }
-                ScanEvent::ScanComplete {
-                    total_size,
-                    total_files,
-                    skipped,
-                } => {
-                    app.scan_status = ScanStatus::Complete;
-                    app.total_size = total_size;
-                    app.total_files = total_files;
-                    app.skipped = skipped;
-
-                    // Build tree from flat entries
-                    app.entries = build_tree(&app.scan_path, &mut path_children);
-                    app.rebuild_flat_entries();
+                    Err(_) => break, // channel empty or disconnected
                 }
             }
         }
 
-        // Handle input
+        // Handle input — always polled every frame
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
-                input::handle_key(app, key);
+                match input::handle_key(app, key) {
+                    InputResult::StartScan(path) => {
+                        // User selected a directory from picker — start scanning
+                        path_children.clear();
+                        *scan_rx = Some(scanner::scan(&path));
+                    }
+                    InputResult::None => {}
+                }
                 if app.should_quit {
                     return Ok(());
                 }
@@ -166,10 +195,8 @@ fn build_tree(
     root: &PathBuf,
     path_children: &mut HashMap<PathBuf, Vec<FileEntry>>,
 ) -> Vec<FileEntry> {
-    // Get direct children of root
     let mut entries = path_children.remove(root).unwrap_or_default();
 
-    // Recursively attach children
     for entry in &mut entries {
         if entry.is_dir {
             entry.children = build_tree(&entry.path, path_children);
@@ -183,13 +210,11 @@ fn build_tree(
 }
 
 fn find_default_rules() -> Option<PathBuf> {
-    // Check relative to CWD
     let cwd_rules = PathBuf::from("rules/default.toml");
     if cwd_rules.exists() {
         return Some(cwd_rules);
     }
 
-    // Check relative to executable
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let exe_rules = dir.join("../../rules/default.toml");

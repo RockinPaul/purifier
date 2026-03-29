@@ -10,7 +10,22 @@ use super::format_size;
 pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     let scan_info = match app.scan_status {
         ScanStatus::Idle => Span::styled("Ready", Style::default().fg(Color::DarkGray)),
-        ScanStatus::Scanning => Span::styled("Scanning...", Style::default().fg(Color::Yellow)),
+        ScanStatus::Scanning => {
+            let dir_display = if app.current_scan_dir.len() > 40 {
+                format!("...{}", &app.current_scan_dir[app.current_scan_dir.len() - 37..])
+            } else {
+                app.current_scan_dir.clone()
+            };
+            Span::styled(
+                format!(
+                    "Scanning... {} files | {} found | {}",
+                    app.files_scanned,
+                    format_size(app.bytes_found),
+                    dir_display,
+                ),
+                Style::default().fg(Color::Yellow),
+            )
+        }
         ScanStatus::Complete => Span::styled(
             format!(
                 "Done — {} in {} files",

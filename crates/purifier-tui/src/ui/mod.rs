@@ -1,12 +1,24 @@
+pub mod dir_picker;
 pub mod tree_view;
 pub mod status_bar;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
 
-use crate::app::{App, View};
+use crate::app::{App, AppScreen, View};
 
 pub fn draw(frame: &mut Frame, app: &App) {
+    match app.screen {
+        AppScreen::DirPicker => {
+            dir_picker::draw(frame, app);
+        }
+        AppScreen::Main => {
+            draw_main(frame, app);
+        }
+    }
+}
+
+fn draw_main(frame: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([

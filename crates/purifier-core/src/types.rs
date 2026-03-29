@@ -92,6 +92,11 @@ pub enum ScanEvent {
         is_dir: bool,
         modified: Option<SystemTime>,
     },
+    Progress {
+        files_scanned: u64,
+        bytes_found: u64,
+        current_dir: String,
+    },
     ScanComplete {
         total_size: u64,
         total_files: u64,

@@ -19,15 +19,6 @@ impl View {
             View::ByAge => "Age",
         }
     }
-
-    pub fn index(&self) -> usize {
-        match self {
-            View::BySize => 0,
-            View::ByType => 1,
-            View::BySafety => 2,
-            View::ByAge => 3,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,7 +28,14 @@ pub enum ScanStatus {
     Complete,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppScreen {
+    DirPicker,
+    Main,
+}
+
 pub struct App {
+    pub screen: AppScreen,
     pub entries: Vec<FileEntry>,
     pub current_view: View,
     pub selected_index: usize,
@@ -52,6 +50,15 @@ pub struct App {
     pub llm_enabled: bool,
     pub llm_online: bool,
     pub flat_entries: Vec<FlatEntry>,
+    // Scan progress (live during scan)
+    pub files_scanned: u64,
+    pub bytes_found: u64,
+    pub current_scan_dir: String,
+    // Directory picker
+    pub dir_picker_options: Vec<PathBuf>,
+    pub dir_picker_selected: usize,
+    pub dir_picker_custom: String,
+    pub dir_picker_typing: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -68,8 +75,17 @@ pub struct FlatEntry {
 }
 
 impl App {
-    pub fn new(scan_path: PathBuf, llm_enabled: bool) -> Self {
+    pub fn new(scan_path: Option<PathBuf>, llm_enabled: bool) -> Self {
+        let screen = if scan_path.is_some() {
+            AppScreen::Main
+        } else {
+            AppScreen::DirPicker
+        };
+
+        let dir_picker_options = build_dir_picker_options();
+
         Self {
+            screen,
             entries: Vec::new(),
             current_view: View::BySize,
             selected_index: 0,
@@ -78,13 +94,29 @@ impl App {
             total_files: 0,
             skipped: 0,
             freed_space: 0,
-            scan_path,
+            scan_path: scan_path.unwrap_or_else(|| PathBuf::from("/")),
             should_quit: false,
             show_delete_confirm: false,
             llm_enabled,
             llm_online: false,
             flat_entries: Vec::new(),
+            files_scanned: 0,
+            bytes_found: 0,
+            current_scan_dir: String::new(),
+            dir_picker_options,
+            dir_picker_selected: 0,
+            dir_picker_custom: String::new(),
+            dir_picker_typing: false,
         }
+    }
+
+    pub fn start_scan_with_path(&mut self, path: PathBuf) {
+        self.scan_path = path;
+        self.screen = AppScreen::Main;
+        self.scan_status = ScanStatus::Scanning;
+        self.files_scanned = 0;
+        self.bytes_found = 0;
+        self.current_scan_dir.clear();
     }
 
     pub fn switch_view(&mut self, view: View) {
@@ -143,7 +175,7 @@ impl App {
             View::BySize => self.flatten_by_size(),
             View::ByType => self.flatten_by_group(|e| e.category),
             View::BySafety => self.flatten_by_group(|e| e.safety),
-            View::ByAge => self.flatten_by_size(), // same tree, will be sorted by age in UI
+            View::ByAge => self.flatten_by_size(),
         }
     }
 
@@ -183,7 +215,6 @@ impl App {
     }
 
     fn flatten_by_group<K: Ord + std::fmt::Display, F: Fn(&FlatEntry) -> K>(&mut self, key_fn: F) {
-        // First build flat list from size view
         let mut all_flat = Vec::new();
         let sorted = {
             let mut s = self.entries.clone();
@@ -194,7 +225,6 @@ impl App {
             Self::collect_flat(entry, 0, vec![i], &mut all_flat);
         }
 
-        // Group by key
         all_flat.sort_by(|a, b| {
             let ka = key_fn(a);
             let kb = key_fn(b);
@@ -228,4 +258,29 @@ impl App {
             Self::collect_flat(child, depth + 1, child_path, out);
         }
     }
+}
+
+fn build_dir_picker_options() -> Vec<PathBuf> {
+    let mut options = vec![PathBuf::from("/")];
+
+    if let Some(home) = dirs::home_dir() {
+        options.push(home.clone());
+
+        let candidates = [
+            home.join("Downloads"),
+            home.join("Library"),
+            home.join("Documents"),
+            home.join("Projects"),
+            home.join("Developer"),
+            home.join("Desktop"),
+        ];
+
+        for path in candidates {
+            if path.exists() {
+                options.push(path);
+            }
+        }
+    }
+
+    options
 }
