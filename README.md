@@ -7,7 +7,7 @@ Purifier scans your filesystem, classifies every path by safety level (Safe / Ca
 ## Features
 
 - **Parallel filesystem scanning** — powered by [jwalk](https://github.com/Byron/jwalk-rs), maxes out your SSD
-- **Hybrid safety classification** — built-in TOML rules for common macOS paths + optional LLM (via [OpenRouter](https://openrouter.ai/)) for unknown paths
+- **Hybrid safety classification** — built-in TOML rules for common macOS paths + optional LLM (via [OpenRouter](https://openrouter.ai/) or OpenAI) for unknown paths
 - **4 tabbed views** — browse by Size, Type, Safety, or Age
 - **Interactive deletion** — per-item confirmation with path, size, safety level, and explanation
 - **Progressive UI** — results stream in as the scan runs, no waiting for completion
@@ -30,7 +30,7 @@ cargo build --release
 purifier                         # scan full disk (/)
 purifier ~/Downloads             # scan specific path
 purifier --no-llm ~/Projects     # skip LLM, rules-only classification
-purifier --api-key YOUR_KEY      # pass OpenRouter API key directly
+purifier --provider openai --api-key YOUR_KEY
 ```
 
 ### Environment variables
@@ -38,6 +38,7 @@ purifier --api-key YOUR_KEY      # pass OpenRouter API key directly
 | Variable | Description |
 |----------|-------------|
 | `OPENROUTER_API_KEY` | OpenRouter API key for LLM classification of unknown paths |
+| `OPENAI_API_KEY` | OpenAI API key for LLM classification of unknown paths |
 
 ### CLI options
 
@@ -46,7 +47,8 @@ purifier --api-key YOUR_KEY      # pass OpenRouter API key directly
 | `[PATH]` | Directory to scan (defaults to `/`) |
 | `--rules <FILE>` | Additional TOML rules file (evaluated before defaults) |
 | `--no-llm` | Disable LLM classification entirely |
-| `--api-key <KEY>` | OpenRouter API key (overrides env var) |
+| `--api-key <KEY>` | API key for the selected remote provider (for example OpenRouter or OpenAI) |
+| `--provider <PROVIDER>` | LLM provider. Runtime-wired options are `openrouter` and `openai`. |
 
 ## Keybindings
 
@@ -90,7 +92,7 @@ Purifier ships with ~30 macOS-specific rules in `rules/default.toml` covering:
 Rules are evaluated top-to-bottom, first match wins. Add your own rules via `--rules my-rules.toml`.
 
 ### LLM fallback
-Paths not matched by any rule are batched (up to 50 at a time) and sent to OpenRouter for classification. The LLM returns a category, safety level, and one-line explanation for each path.
+Paths not matched by any rule are batched (up to 50 at a time) and sent to the configured LLM provider for classification. OpenRouter and OpenAI use chat completions APIs. The LLM returns a category, safety level, and one-line explanation for each path.
 
 If the LLM is unavailable, unmatched paths stay "Unknown" — the tool is fully usable without an API key.
 
@@ -139,7 +141,7 @@ Two-crate workspace:
 | [crossterm](https://github.com/crossterm-rs/crossterm) | Terminal input/output |
 | [jwalk](https://github.com/Byron/jwalk-rs) | Parallel filesystem walking |
 | [crossbeam-channel](https://github.com/crossbeam-rs/crossbeam) | Scanner-to-TUI message passing |
-| [reqwest](https://github.com/seanmonstar/reqwest) | HTTP client for OpenRouter |
+| [reqwest](https://github.com/seanmonstar/reqwest) | HTTP client for supported LLM providers |
 | [clap](https://github.com/clap-rs/clap) | CLI argument parsing |
 | [glob](https://github.com/rust-lang/glob) | Pattern matching for rules |
 

@@ -3,9 +3,12 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use purifier_core::provider::{default_provider_settings, ProviderKind};
 use purifier_core::types::{Category, FileEntry, SafetyLevel};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use crate::config::AppConfig;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[expect(
     clippy::enum_variant_names,
     reason = "Tab names intentionally mirror the user-visible By Size/By Type/By Safety/By Age labels"
@@ -15,6 +18,40 @@ pub enum View {
     ByType,
     BySafety,
     ByAge,
+}
+
+#[cfg(test)]
+mod modal_tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::config::AppConfig;
+    use purifier_core::provider::ProviderKind;
+
+    #[test]
+    fn start_scan_with_path_should_record_last_scan_path_for_persistence() {
+        let mut app = App::new(Some(PathBuf::from("/")), false, AppConfig::default());
+
+        app.start_scan_with_path(PathBuf::from("/tmp/project"));
+
+        assert_eq!(
+            app.preferences.ui.last_scan_path,
+            Some(PathBuf::from("/tmp/project"))
+        );
+    }
+
+    #[test]
+    fn onboarding_modal_should_default_to_openrouter_when_no_provider_is_configured() {
+        let mut app = App::new(Some(PathBuf::from("/")), true, AppConfig::default());
+        app.open_onboarding();
+
+        match app.modal.as_ref() {
+            Some(AppModal::Onboarding(draft)) => {
+                assert_eq!(draft.provider, ProviderKind::OpenRouter)
+            }
+            other => panic!("expected onboarding modal, got {other:?}"),
+        }
+    }
 }
 
 impl View {
@@ -41,6 +78,37 @@ pub enum AppScreen {
     Main,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LlmStatus {
+    Disabled,
+    NeedsSetup,
+    Ready(ProviderKind),
+    #[expect(
+        dead_code,
+        reason = "Error state is reserved for follow-up settings flow"
+    )]
+    Error(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingsDraft {
+    pub provider: ProviderKind,
+    pub api_key: String,
+    pub api_key_edited: bool,
+    pub api_key_editing: bool,
+    pub model: String,
+    pub base_url: String,
+    pub llm_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppModal {
+    DeleteConfirm,
+    Settings(SettingsDraft),
+    #[cfg_attr(not(test), allow(dead_code))]
+    Onboarding(SettingsDraft),
+}
+
 pub struct App {
     pub screen: AppScreen,
     pub entries: Vec<FileEntry>,
@@ -53,11 +121,14 @@ pub struct App {
     pub freed_space: u64,
     pub scan_path: PathBuf,
     pub should_quit: bool,
-    pub show_delete_confirm: bool,
+    pub preferences: AppConfig,
+    pub modal: Option<AppModal>,
     pub last_error: Option<String>,
+    pub last_warning: Option<String>,
     pub expanded_paths: HashSet<PathBuf>,
     pub deleted_paths: HashSet<PathBuf>,
     pub llm_enabled: bool,
+    pub llm_status: LlmStatus,
     pub llm_online: bool,
     pub flat_entries: Vec<FlatEntry>,
     // Scan progress (live during scan)
@@ -85,32 +156,41 @@ pub struct FlatEntry {
 }
 
 impl App {
-    pub fn new(scan_path: Option<PathBuf>, llm_enabled: bool) -> Self {
+    pub fn new(scan_path: Option<PathBuf>, llm_enabled: bool, preferences: AppConfig) -> Self {
         let screen = if scan_path.is_some() {
             AppScreen::Main
         } else {
             AppScreen::DirPicker
         };
-
+        let current_view = preferences.ui.default_view;
         let dir_picker_options = build_dir_picker_options();
 
         Self {
             screen,
             entries: Vec::new(),
-            current_view: View::BySize,
+            current_view,
             selected_index: 0,
             scan_status: ScanStatus::Idle,
             total_size: 0,
             total_files: 0,
             skipped: 0,
             freed_space: 0,
-            scan_path: scan_path.unwrap_or_else(|| PathBuf::from("/")),
+            scan_path: scan_path
+                .or_else(|| preferences.ui.last_scan_path.clone())
+                .unwrap_or_else(|| PathBuf::from("/")),
             should_quit: false,
-            show_delete_confirm: false,
+            preferences,
+            modal: None,
             last_error: None,
+            last_warning: None,
             expanded_paths: HashSet::new(),
             deleted_paths: HashSet::new(),
             llm_enabled,
+            llm_status: if llm_enabled {
+                LlmStatus::NeedsSetup
+            } else {
+                LlmStatus::Disabled
+            },
             llm_online: false,
             flat_entries: Vec::new(),
             files_scanned: 0,
@@ -123,19 +203,73 @@ impl App {
         }
     }
 
+    pub fn open_settings(&mut self) {
+        self.modal = Some(AppModal::Settings(self.build_settings_draft()));
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn open_onboarding(&mut self) {
+        self.modal = Some(AppModal::Onboarding(self.build_settings_draft()));
+    }
+
+    pub fn open_delete_confirm(&mut self) {
+        self.modal = Some(AppModal::DeleteConfirm);
+    }
+
+    pub fn close_modal(&mut self) {
+        self.modal = None;
+    }
+
+    fn build_settings_draft(&self) -> SettingsDraft {
+        let provider = match self.preferences.llm.active_provider {
+            // TODO(#ollama-support): restore direct Ollama editing when runtime support returns.
+            ProviderKind::Ollama => ProviderKind::OpenRouter,
+            provider => provider,
+        };
+        let settings = self
+            .preferences
+            .llm
+            .providers
+            .get(&provider)
+            .cloned()
+            .unwrap_or_else(|| default_provider_settings(provider));
+
+        SettingsDraft {
+            provider,
+            api_key: String::new(),
+            api_key_edited: false,
+            api_key_editing: false,
+            model: settings.model,
+            base_url: settings.base_url,
+            llm_enabled: self.preferences.llm.enabled,
+        }
+    }
+
     pub fn start_scan_with_path(&mut self, path: PathBuf) {
+        self.preferences.ui.last_scan_path = Some(path.clone());
         self.scan_path = path;
         self.screen = AppScreen::Main;
         self.scan_status = ScanStatus::Scanning;
+        self.entries.clear();
+        self.flat_entries.clear();
+        self.selected_index = 0;
+        self.total_size = 0;
+        self.total_files = 0;
+        self.skipped = 0;
+        self.freed_space = 0;
         self.files_scanned = 0;
         self.bytes_found = 0;
         self.current_scan_dir.clear();
+        self.close_modal();
+        self.last_error = None;
+        self.last_warning = None;
         self.expanded_paths.clear();
         self.deleted_paths.clear();
     }
 
     pub fn switch_view(&mut self, view: View) {
         self.current_view = view;
+        self.preferences.ui.default_view = view;
         self.selected_index = 0;
         self.rebuild_flat_entries();
     }
@@ -351,6 +485,7 @@ fn build_dir_picker_options() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::AppConfig;
     use std::time::{Duration, SystemTime};
 
     fn dir(path: &str, size: u64) -> FileEntry {
@@ -363,7 +498,7 @@ mod tests {
 
     #[test]
     fn toggle_expand_should_target_selected_path_when_entries_are_size_sorted() {
-        let mut app = App::new(Some(PathBuf::from("/")), false);
+        let mut app = App::new(Some(PathBuf::from("/")), false, AppConfig::default());
         app.entries = vec![dir("/small", 10), dir("/large", 20)];
         app.rebuild_flat_entries();
 
@@ -380,7 +515,7 @@ mod tests {
 
     #[test]
     fn remove_entry_by_path_should_remove_selected_path_when_entries_are_size_sorted() {
-        let mut app = App::new(Some(PathBuf::from("/")), false);
+        let mut app = App::new(Some(PathBuf::from("/")), false, AppConfig::default());
         app.entries = vec![dir("/small", 10), dir("/large", 20)];
         app.rebuild_flat_entries();
 
@@ -398,7 +533,7 @@ mod tests {
     fn age_view_should_sort_oldest_first_and_put_missing_timestamps_last() {
         let older = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
         let newer = SystemTime::UNIX_EPOCH + Duration::from_secs(20);
-        let mut app = App::new(Some(PathBuf::from("/")), false);
+        let mut app = App::new(Some(PathBuf::from("/")), false, AppConfig::default());
         app.entries = vec![
             file("/none", 5, None),
             file("/newer", 5, Some(newer)),
@@ -425,7 +560,7 @@ mod tests {
     #[test]
     fn age_view_should_use_size_as_tiebreaker_for_matching_timestamps() {
         let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
-        let mut app = App::new(Some(PathBuf::from("/")), false);
+        let mut app = App::new(Some(PathBuf::from("/")), false, AppConfig::default());
         app.entries = vec![
             file("/small", 10, Some(modified)),
             file("/large", 20, Some(modified)),

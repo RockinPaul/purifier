@@ -1,9 +1,14 @@
 pub mod classifier;
 pub mod llm;
+pub mod provider;
 pub mod rules;
 pub mod scanner;
 pub mod types;
 
+pub use provider::{
+    LlmClient, LlmError, ProviderKind, ProviderSettings, ProviderSettingsMap,
+    ResolvedProviderConfig,
+};
 pub use types::{Category, FileEntry, SafetyLevel, ScanEvent};
 
 use std::path::Path;

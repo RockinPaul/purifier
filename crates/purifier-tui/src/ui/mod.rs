@@ -1,11 +1,12 @@
 pub mod dir_picker;
+pub mod settings_modal;
 pub mod status_bar;
 pub mod tree_view;
 
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::Frame;
 
-use crate::app::{App, AppScreen, View};
+use crate::app::{App, AppModal, AppScreen, View};
 
 pub fn draw(frame: &mut Frame, app: &App) {
     match app.screen {
@@ -15,6 +16,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
         AppScreen::Main => {
             draw_main(frame, app);
         }
+    }
+
+    if let Some(modal) = global_overlay_modal(app) {
+        draw_modal(frame, app, modal);
     }
 }
 
@@ -39,8 +44,26 @@ fn draw_main(frame: &mut Frame, app: &App) {
 
     status_bar::draw(frame, app, chunks[3]);
 
-    if app.show_delete_confirm {
-        draw_delete_confirm(frame, app);
+    if matches!(app.modal, Some(AppModal::DeleteConfirm)) {
+        let Some(modal) = app.modal.as_ref() else {
+            return;
+        };
+        draw_modal(frame, app, modal);
+    }
+}
+
+fn global_overlay_modal(app: &App) -> Option<&AppModal> {
+    match app.modal.as_ref() {
+        Some(AppModal::Settings(_)) | Some(AppModal::Onboarding(_)) => app.modal.as_ref(),
+        _ => None,
+    }
+}
+
+fn draw_modal(frame: &mut Frame, app: &App, modal: &AppModal) {
+    match modal {
+        AppModal::DeleteConfirm => draw_delete_confirm(frame, app),
+        AppModal::Settings(_) => settings_modal::draw(frame, app, " Settings "),
+        AppModal::Onboarding(_) => settings_modal::draw(frame, app, " First Launch Setup "),
     }
 }
 
@@ -75,19 +98,11 @@ fn draw_tab_bar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 }
 
 fn draw_delete_confirm(frame: &mut Frame, app: &App) {
-    use ratatui::layout::{Constraint, Flex, Layout};
     use ratatui::style::{Color, Style};
     use ratatui::text::{Line, Span};
     use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
-    let area = frame.area();
-    let popup_width = 60.min(area.width.saturating_sub(4));
-    let popup_height = 8.min(area.height.saturating_sub(4));
-
-    let vertical = Layout::vertical([Constraint::Length(popup_height)]).flex(Flex::Center);
-    let horizontal = Layout::horizontal([Constraint::Length(popup_width)]).flex(Flex::Center);
-    let [popup_area] = vertical.areas(area);
-    let [popup_area] = horizontal.areas(popup_area);
+    let popup_area = centered_popup_area(frame.area(), 60, 8);
 
     frame.render_widget(Clear, popup_area);
 
@@ -138,6 +153,23 @@ fn draw_delete_confirm(frame: &mut Frame, app: &App) {
     }
 }
 
+fn centered_popup_area(
+    area: ratatui::layout::Rect,
+    popup_width: u16,
+    popup_height: u16,
+) -> ratatui::layout::Rect {
+    use ratatui::layout::{Constraint, Flex, Layout};
+
+    let popup_width = popup_width.min(area.width.saturating_sub(4));
+    let popup_height = popup_height.min(area.height.saturating_sub(4));
+
+    let vertical = Layout::vertical([Constraint::Length(popup_height)]).flex(Flex::Center);
+    let horizontal = Layout::horizontal([Constraint::Length(popup_width)]).flex(Flex::Center);
+    let [popup_area] = vertical.areas(area);
+    let [popup_area] = horizontal.areas(popup_area);
+    popup_area
+}
+
 pub fn format_size(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
@@ -186,5 +218,24 @@ mod tests {
     #[test]
     fn truncate_tail_should_preserve_unicode_boundaries() {
         assert_eq!(truncate_tail("ab😀c😀d", 5), "...😀d");
+    }
+
+    #[test]
+    fn global_overlay_modal_should_include_onboarding_outside_main_screen() {
+        let mut app = App::new(None, true, crate::config::AppConfig::default());
+        app.open_onboarding();
+
+        assert!(matches!(
+            global_overlay_modal(&app),
+            Some(AppModal::Onboarding(_))
+        ));
+    }
+
+    #[test]
+    fn global_overlay_modal_should_exclude_delete_confirm() {
+        let mut app = App::new(None, false, crate::config::AppConfig::default());
+        app.open_delete_confirm();
+
+        assert!(global_overlay_modal(&app).is_none());
     }
 }
