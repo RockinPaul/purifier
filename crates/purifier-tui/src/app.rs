@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use purifier_core::provider::{default_provider_settings, ProviderKind};
+use purifier_core::size::SizeMode;
 use purifier_core::types::{Category, FileEntry, SafetyLevel};
+use purifier_core::DeleteOutcome;
 
 use crate::config::AppConfig;
 
@@ -96,6 +98,8 @@ pub struct SettingsDraft {
     pub model: String,
     pub base_url: String,
     pub llm_enabled: bool,
+    pub size_mode: SizeMode,
+    pub selected_scan_profile: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,9 +117,11 @@ pub struct App {
     pub selected_index: usize,
     pub scan_status: ScanStatus,
     pub total_size: u64,
+    pub total_logical_size: u64,
+    pub total_physical_size: u64,
     pub total_files: u64,
     pub skipped: u64,
-    pub freed_space: u64,
+    pub delete_stats: DeleteOutcome,
     pub scan_path: PathBuf,
     pub should_quit: bool,
     pub preferences: AppConfig,
@@ -135,7 +141,10 @@ pub struct App {
     // Scan progress (live during scan)
     pub files_scanned: u64,
     pub bytes_found: u64,
+    pub logical_bytes_found: u64,
+    pub physical_bytes_found: u64,
     pub current_scan_dir: String,
+    pub applied_scan_profile_name: Option<String>,
     // Directory picker
     pub dir_picker_options: Vec<PathBuf>,
     pub dir_picker_selected: usize,
@@ -148,6 +157,8 @@ pub struct FlatEntry {
     pub depth: usize,
     pub path: PathBuf,
     pub size: u64,
+    pub logical_size: u64,
+    pub physical_size: u64,
     pub is_dir: bool,
     pub expanded: bool,
     pub modified: Option<SystemTime>,
@@ -173,9 +184,11 @@ impl App {
             selected_index: 0,
             scan_status: ScanStatus::Idle,
             total_size: 0,
+            total_logical_size: 0,
+            total_physical_size: 0,
             total_files: 0,
             skipped: 0,
-            freed_space: 0,
+            delete_stats: DeleteOutcome::default(),
             scan_path: scan_path
                 .or_else(|| preferences.ui.last_scan_path.clone())
                 .unwrap_or_else(|| PathBuf::from("/")),
@@ -200,7 +213,10 @@ impl App {
             flat_entries: Vec::new(),
             files_scanned: 0,
             bytes_found: 0,
+            logical_bytes_found: 0,
+            physical_bytes_found: 0,
             current_scan_dir: String::new(),
+            applied_scan_profile_name: None,
             dir_picker_options,
             dir_picker_selected: 0,
             dir_picker_custom: String::new(),
@@ -256,6 +272,11 @@ impl App {
             model: settings.model,
             base_url: settings.base_url,
             llm_enabled: self.preferences.llm.enabled,
+            size_mode: self.size_mode(),
+            selected_scan_profile: self
+                .preferences
+                .active_scan_profile()
+                .map(|profile| profile.name.clone()),
         }
     }
 
@@ -268,12 +289,17 @@ impl App {
         self.flat_entries.clear();
         self.selected_index = 0;
         self.total_size = 0;
+        self.total_logical_size = 0;
+        self.total_physical_size = 0;
         self.total_files = 0;
         self.skipped = 0;
-        self.freed_space = 0;
+        self.delete_stats = DeleteOutcome::default();
         self.files_scanned = 0;
         self.bytes_found = 0;
+        self.logical_bytes_found = 0;
+        self.physical_bytes_found = 0;
         self.current_scan_dir.clear();
+        self.applied_scan_profile_name = None;
         self.close_modal();
         self.last_error = None;
         self.last_warning = None;
@@ -286,6 +312,33 @@ impl App {
         self.preferences.ui.default_view = view;
         self.selected_index = 0;
         self.rebuild_flat_entries();
+    }
+
+    pub fn size_mode(&self) -> SizeMode {
+        self.preferences.ui.size_mode
+    }
+
+    pub fn active_scan_profile_name(&self) -> Option<&str> {
+        match self.scan_status {
+            ScanStatus::Scanning | ScanStatus::Complete => {
+                self.applied_scan_profile_name.as_deref()
+            }
+            ScanStatus::Idle => self
+                .preferences
+                .active_scan_profile()
+                .map(|profile| profile.name.as_str()),
+        }
+    }
+
+    pub fn sync_display_size_state(&mut self) {
+        self.total_size = match self.size_mode() {
+            SizeMode::Physical => self.total_physical_size,
+            SizeMode::Logical => self.total_logical_size,
+        };
+        self.bytes_found = match self.size_mode() {
+            SizeMode::Physical => self.physical_bytes_found,
+            SizeMode::Logical => self.logical_bytes_found,
+        };
     }
 
     pub fn move_up(&mut self) {
@@ -384,7 +437,7 @@ impl App {
 
     fn flatten_by_size(&mut self) {
         let mut sorted = self.entries.clone();
-        sorted.sort_by_key(|entry| Reverse(entry.total_size()));
+        sorted.sort_by_key(|entry| Reverse(entry.total_size(self.size_mode())));
 
         for entry in &sorted {
             self.flatten_entry(entry, 0);
@@ -395,7 +448,9 @@ impl App {
         self.flat_entries.push(FlatEntry {
             depth,
             path: entry.path.clone(),
-            size: entry.total_size(),
+            size: entry.total_size(self.size_mode()),
+            logical_size: entry.total_size(SizeMode::Logical),
+            physical_size: entry.total_size(SizeMode::Physical),
             is_dir: entry.is_dir,
             expanded: entry.expanded,
             modified: entry.modified,
@@ -406,7 +461,7 @@ impl App {
 
         if entry.expanded {
             let mut children: Vec<&FileEntry> = entry.children.iter().collect();
-            children.sort_by_key(|entry| Reverse(entry.total_size()));
+            children.sort_by_key(|entry| Reverse(entry.total_size(self.size_mode())));
 
             for child in children {
                 self.flatten_entry(child, depth + 1);
@@ -418,11 +473,11 @@ impl App {
         let mut all_flat = Vec::new();
         let sorted = {
             let mut s = self.entries.clone();
-            s.sort_by_key(|entry| Reverse(entry.total_size()));
+            s.sort_by_key(|entry| Reverse(entry.total_size(self.size_mode())));
             s
         };
         for entry in &sorted {
-            Self::collect_flat(entry, 0, &mut all_flat);
+            Self::collect_flat(entry, 0, self.size_mode(), &mut all_flat);
         }
 
         all_flat.sort_by(|a, b| {
@@ -437,7 +492,7 @@ impl App {
     fn flatten_by_age(&mut self) {
         let mut all_flat = Vec::new();
         for entry in &self.entries {
-            Self::collect_flat(entry, 0, &mut all_flat);
+            Self::collect_flat(entry, 0, self.size_mode(), &mut all_flat);
         }
 
         all_flat.sort_by(|a, b| match (a.modified, b.modified) {
@@ -452,11 +507,18 @@ impl App {
         self.flat_entries = all_flat;
     }
 
-    fn collect_flat(entry: &FileEntry, depth: usize, out: &mut Vec<FlatEntry>) {
+    fn collect_flat(
+        entry: &FileEntry,
+        depth: usize,
+        size_mode: SizeMode,
+        out: &mut Vec<FlatEntry>,
+    ) {
         out.push(FlatEntry {
             depth,
             path: entry.path.clone(),
-            size: entry.total_size(),
+            size: entry.total_size(size_mode),
+            logical_size: entry.total_size(SizeMode::Logical),
+            physical_size: entry.total_size(SizeMode::Physical),
             is_dir: entry.is_dir,
             expanded: entry.expanded,
             modified: entry.modified,
@@ -466,7 +528,7 @@ impl App {
         });
 
         for child in &entry.children {
-            Self::collect_flat(child, depth + 1, out);
+            Self::collect_flat(child, depth + 1, size_mode, out);
         }
     }
 }
@@ -500,6 +562,7 @@ fn build_dir_picker_options() -> Vec<PathBuf> {
 mod tests {
     use super::*;
     use crate::config::AppConfig;
+    use purifier_core::size::EntrySizes;
     use std::time::{Duration, SystemTime};
 
     fn dir(path: &str, size: u64) -> FileEntry {
@@ -591,5 +654,93 @@ mod tests {
             paths,
             vec![PathBuf::from("/large"), PathBuf::from("/small")]
         );
+    }
+
+    #[test]
+    fn size_view_should_sort_by_selected_size_mode() {
+        let entries = vec![
+            FileEntry::new_with_sizes(
+                PathBuf::from("/logical-large"),
+                EntrySizes {
+                    logical_bytes: 20,
+                    physical_bytes: 4096,
+                    accounted_physical_bytes: 4096,
+                },
+                None,
+                false,
+                None,
+            ),
+            FileEntry::new_with_sizes(
+                PathBuf::from("/physical-large"),
+                EntrySizes {
+                    logical_bytes: 10,
+                    physical_bytes: 8192,
+                    accounted_physical_bytes: 8192,
+                },
+                None,
+                false,
+                None,
+            ),
+        ];
+
+        let mut logical_config = AppConfig::default();
+        logical_config.ui.size_mode = SizeMode::Logical;
+        let mut logical_app = App::new(Some(PathBuf::from("/")), false, logical_config);
+        logical_app.entries = entries.clone();
+        logical_app.rebuild_flat_entries();
+
+        let logical_paths: Vec<PathBuf> = logical_app
+            .flat_entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect();
+        assert_eq!(
+            logical_paths,
+            vec![
+                PathBuf::from("/logical-large"),
+                PathBuf::from("/physical-large"),
+            ]
+        );
+        assert_eq!(logical_app.flat_entries[0].size, 20);
+
+        let mut physical_config = AppConfig::default();
+        physical_config.ui.size_mode = SizeMode::Physical;
+        let mut physical_app = App::new(Some(PathBuf::from("/")), false, physical_config);
+        physical_app.entries = entries;
+        physical_app.rebuild_flat_entries();
+
+        let physical_paths: Vec<PathBuf> = physical_app
+            .flat_entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect();
+        assert_eq!(
+            physical_paths,
+            vec![
+                PathBuf::from("/physical-large"),
+                PathBuf::from("/logical-large"),
+            ]
+        );
+        assert_eq!(physical_app.flat_entries[0].size, 8192);
+    }
+
+    #[test]
+    fn open_settings_should_ignore_stale_selected_scan_profile() {
+        let mut config = AppConfig::default();
+        config.ui.last_selected_scan_profile = Some("missing-profile".to_string());
+        config.ui.scan_profiles = vec![purifier_core::ScanProfile {
+            name: "existing-profile".to_string(),
+            exclude: None,
+            mask: None,
+            display_filter: None,
+        }];
+        let mut app = App::new(Some(PathBuf::from("/")), false, config);
+
+        app.open_settings();
+
+        let Some(AppModal::Settings(draft)) = app.modal.as_ref() else {
+            panic!("settings modal should open");
+        };
+        assert_eq!(draft.selected_scan_profile, None);
     }
 }

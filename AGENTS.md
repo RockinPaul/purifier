@@ -29,6 +29,14 @@ Do not re-enable `Ollama` casually. Keep or add explicit TODO comments instead u
 - After successful settings save, the app refreshes runtime state in-process.
 - Status/warning messaging should stay truthful about launch-time CLI/env overrides.
 
+## Size And Scan Truth
+
+- Default size mode is `Physical`; `Logical` remains a user-selectable alternative.
+- Physical totals are hard-link-aware and based on allocated blocks on Unix/macOS.
+- APFS clone/shared-block accounting is still best-effort; do not claim exact unique physical ownership.
+- The current scan UX is blocking and hides the tree until completion; do not document or imply progressive visible tree updates unless that behavior is intentionally restored.
+- Built-in scan profile names are reserved and should remain user-visible defaults that can evolve across releases.
+
 ## LLM Result Handling
 
 - Current accepted behavior: if a provider returns partial or path-misaligned batch results, rows may remain at `Analyzing with LLM...`.

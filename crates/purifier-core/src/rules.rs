@@ -18,7 +18,7 @@ struct RuleDef {
     reason: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct CompiledRule {
     pattern: glob::Pattern,
     category: Category,
@@ -26,7 +26,7 @@ struct CompiledRule {
     reason: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RulesEngine {
     rules: Vec<CompiledRule>,
 }

@@ -6,11 +6,14 @@ Purifier scans your filesystem, classifies every path by safety level (Safe / Ca
 
 ## Features
 
-- **Parallel filesystem scanning** — powered by [jwalk](https://github.com/Byron/jwalk-rs), maxes out your SSD
+- **Parallel filesystem scanning** — powered by [jwalk](https://github.com/Byron/jwalk-rs)
+- **Physical disk usage by default** — allocated blocks are used for totals, with a logical-size toggle available in settings
+- **Hard-link-aware accounting** — physical totals count shared storage once instead of once per pathname
+- **Responsive blocking scan UI** — scan progress stays visible and `q` / `Esc` remain responsive while the tree stays hidden until completion
+- **Scan profiles** — choose between built-in profiles like `Full scan` and `Fast developer scan`
 - **Hybrid safety classification** — built-in TOML rules for common macOS paths + optional LLM (via [OpenRouter](https://openrouter.ai/) or OpenAI) for unknown paths
 - **4 tabbed views** — browse by Size, Type, Safety, or Age
-- **Interactive deletion** — per-item confirmation with path, size, safety level, and explanation
-- **Progressive UI** — results stream in as the scan runs, no waiting for completion
+- **Interactive deletion** — confirmation shows logical size and estimated physical free space; status bar keeps logical removed bytes and physical freed space separate
 - **Vim-style navigation** — `j`/`k`/`h`/`l`, arrow keys, Enter to expand/collapse
 
 ## Installation
@@ -62,10 +65,15 @@ purifier --provider openai --api-key YOUR_KEY
 | `y` / `n` | Confirm / cancel deletion |
 | `q` / `Esc` | Quit |
 
+Inside the settings modal:
+
+- `m` toggles between `Physical` and `Logical` size mode
+- `p` cycles the saved scan profile
+
 ## Views
 
 ### Tab 1: By Size (default)
-Directory tree sorted by size, largest first. Each entry shows a proportional size bar and a colored safety badge.
+Directory tree sorted by the currently selected size mode, largest first. Each entry shows a proportional size bar and a colored safety badge.
 
 ### Tab 2: By Type
 Entries grouped by category: Build Artifacts, Caches, Downloads, App Data, Media, System, Unknown.
@@ -96,6 +104,47 @@ Paths not matched by any rule are batched (up to 50 at a time) and sent to the c
 
 If the LLM is unavailable, unmatched paths stay "Unknown" — the tool is fully usable without an API key.
 
+## Size semantics
+
+Purifier tracks two size measurements:
+
+- **Physical** — allocated bytes on disk, based on filesystem block allocation
+- **Logical** — file content length, closer to what Finder usually shows
+
+Physical size is the default mode in the TUI. Logical size is still available from settings.
+
+Important notes:
+
+- Physical totals are **hard-link-aware** and count shared storage once.
+- Per-path delete feedback prefers the **observed volume free-space delta** when available, and falls back to an estimate otherwise.
+- APFS clone/shared-block accounting is still **best-effort**. Purifier can see allocated blocks and hard links, but it does not compute exact unique physical ownership for APFS clones or snapshots.
+
+## Scan model
+
+- Scans are currently **blocking**: the progress popup stays visible and the directory tree stays hidden until the scan completes.
+- The scan UI remains responsive to `q` / `Esc`.
+- LLM batching for unknown paths can overlap with the hidden scan phase, but rows only become visible after the final tree is ready.
+
+## Scan profiles
+
+Purifier supports GrandPerspective-style scan profiles. The current UI lets you select a persisted profile in settings, and the scanner uses the profile's **exclude** filter during traversal.
+
+Built-in profiles:
+
+- `Full scan` — no exclusions
+- `Fast developer scan` — excludes common heavyweight developer artifacts such as `node_modules`, `target`, and `DerivedData`
+
+The core filter engine supports tests based on:
+
+- name
+- path glob
+- size bounds
+- file type
+- hard-link status
+- package status
+
+At the moment, the shipped UI focuses on profile selection and scan-time exclusion. More advanced mask/display-filter controls are not exposed yet.
+
 ## Custom rules
 
 Create a TOML file with your own rules:
@@ -123,8 +172,8 @@ Custom rules are evaluated **before** the defaults, so they take priority.
 ```
 purifier/
 ├── crates/
-│   ├── purifier-core/       # library: scanner, rules, classifier, LLM client
-│   └── purifier-tui/        # binary: Ratatui frontend, CLI, event loop
+│   ├── purifier-core/       # library: scanner, filters, size model, classifier, LLM client
+│   └── purifier-tui/        # binary: Ratatui frontend, config, event loop
 └── rules/
     └── default.toml         # built-in macOS safety rules
 ```
@@ -144,12 +193,13 @@ Two-crate workspace:
 | [reqwest](https://github.com/seanmonstar/reqwest) | HTTP client for supported LLM providers |
 | [clap](https://github.com/clap-rs/clap) | CLI argument parsing |
 | [glob](https://github.com/rust-lang/glob) | Pattern matching for rules |
+| [keyring](https://github.com/open-source-cooperative/keyring-rs) | macOS Keychain integration |
 
 ## Development
 
 ```bash
 cargo build            # debug build
-cargo test             # run all tests (28 unit tests)
+cargo test             # run all tests
 cargo run -- ~/tmp     # quick test scan
 cargo clippy --all-targets --all-features --locked -- -D warnings
 ```

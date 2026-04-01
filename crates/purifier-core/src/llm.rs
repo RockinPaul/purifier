@@ -107,8 +107,13 @@ impl OpenRouterClient {
         &self,
         entries: &[UnknownEntry],
     ) -> Result<Vec<LlmClassification>, LlmError> {
-        classify_with_openai_compatible_api(&self.client, &self.config, &self.chat_endpoint(), entries)
-            .await
+        classify_with_openai_compatible_api(
+            &self.client,
+            &self.config,
+            &self.chat_endpoint(),
+            entries,
+        )
+        .await
     }
 }
 
@@ -146,8 +151,13 @@ impl OpenAiClient {
         &self,
         entries: &[UnknownEntry],
     ) -> Result<Vec<LlmClassification>, LlmError> {
-        classify_with_openai_compatible_api(&self.client, &self.config, &self.chat_endpoint(), entries)
-            .await
+        classify_with_openai_compatible_api(
+            &self.client,
+            &self.config,
+            &self.chat_endpoint(),
+            entries,
+        )
+        .await
     }
 }
 
@@ -157,26 +167,20 @@ async fn classify_with_openai_compatible_api(
     chat_endpoint: &str,
     entries: &[UnknownEntry],
 ) -> Result<Vec<LlmClassification>, LlmError> {
-    let api_key = config
-        .api_key
-        .as_deref()
-        .ok_or(LlmError::MissingApiKey { provider: config.kind })?;
+    let api_key = config.api_key.as_deref().ok_or(LlmError::MissingApiKey {
+        provider: config.kind,
+    })?;
     let request = classification_request(config, entries);
 
-    let response = send_openai_compatible_request(
-        client,
-        config,
-        chat_endpoint,
-        api_key,
-        &request,
-        None,
-    )
-    .await?;
+    let response =
+        send_openai_compatible_request(client, config, chat_endpoint, api_key, &request, None)
+            .await?;
 
-    let chat_response: ChatResponse = response.json().await.map_err(|error| LlmError::Response {
-        provider: config.kind,
-        message: error.to_string(),
-    })?;
+    let chat_response: ChatResponse =
+        response.json().await.map_err(|error| LlmError::Response {
+            provider: config.kind,
+            message: error.to_string(),
+        })?;
 
     parse_chat_response(config.kind, chat_response)
 }
@@ -186,10 +190,9 @@ async fn validate_openai_compatible_connection(
     config: &ResolvedProviderConfig,
     chat_endpoint: &str,
 ) -> Result<(), LlmError> {
-    let api_key = config
-        .api_key
-        .as_deref()
-        .ok_or(LlmError::MissingApiKey { provider: config.kind })?;
+    let api_key = config.api_key.as_deref().ok_or(LlmError::MissingApiKey {
+        provider: config.kind,
+    })?;
     let request = validation_request(config);
 
     let response = send_openai_compatible_request(
@@ -202,10 +205,11 @@ async fn validate_openai_compatible_connection(
     )
     .await?;
 
-    let chat_response: ChatResponse = response.json().await.map_err(|error| LlmError::Response {
-        provider: config.kind,
-        message: error.to_string(),
-    })?;
+    let chat_response: ChatResponse =
+        response.json().await.map_err(|error| LlmError::Response {
+            provider: config.kind,
+            message: error.to_string(),
+        })?;
 
     let parsed = parse_chat_response(config.kind, chat_response)?;
     if parsed
@@ -234,7 +238,10 @@ fn openai_compatible_chat_endpoint(base_url: &str) -> String {
     }
 }
 
-fn classification_request(config: &ResolvedProviderConfig, entries: &[UnknownEntry]) -> ChatRequest {
+fn classification_request(
+    config: &ResolvedProviderConfig,
+    entries: &[UnknownEntry],
+) -> ChatRequest {
     ChatRequest {
         model: config.model.clone(),
         messages: vec![Message {
@@ -423,7 +430,6 @@ fn parse_response_content(
     provider: ProviderKind,
     content: &str,
 ) -> Result<Vec<LlmClassification>, LlmError> {
-
     // Strip markdown code fences if present
     let json_str = content
         .trim()
@@ -451,9 +457,9 @@ fn parse_response_content(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
     use std::thread;
 
     use super::*;
@@ -498,8 +504,7 @@ mod tests {
             let bytes_read = stream.read(&mut buffer).expect("test server should read");
             *captured_request_for_thread
                 .lock()
-                .expect("capture lock should succeed") =
-                buffer[..bytes_read].to_vec();
+                .expect("capture lock should succeed") = buffer[..bytes_read].to_vec();
             if let Some(delay) = delay_before_response {
                 thread::sleep(delay);
             }
@@ -569,7 +574,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn openai_client_should_validate_connection_with_minimal_chat_request_for_configured_model() {
+    async fn openai_client_should_validate_connection_with_minimal_chat_request_for_configured_model(
+    ) {
         let captured_request = Arc::new(Mutex::new(Vec::new()));
         let base_url = spawn_http_server_with_capture(
             "200 OK",
@@ -665,7 +671,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn openai_client_should_use_base_url_directly_when_it_already_points_to_chat_completions() {
+    async fn openai_client_should_use_base_url_directly_when_it_already_points_to_chat_completions()
+    {
         let captured_request = Arc::new(Mutex::new(Vec::new()));
         let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
         let address = listener
@@ -679,8 +686,7 @@ mod tests {
             let bytes_read = stream.read(&mut buffer).expect("test server should read");
             *captured_request_for_thread
                 .lock()
-                .expect("capture lock should succeed") =
-                buffer[..bytes_read].to_vec();
+                .expect("capture lock should succeed") = buffer[..bytes_read].to_vec();
             let body = r#"{"choices":[{"message":{"content":"[{\"path\":\"/tmp/purifier-validation\",\"category\":\"BuildArtifact\",\"safety\":\"Safe\",\"reason\":\"Validation probe\"}]"}}]}"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
@@ -743,15 +749,17 @@ mod tests {
         }
     }
 
-    fn parse_chat_response(chat_response: ChatResponse) -> Result<Vec<LlmClassification>, LlmError> {
+    fn parse_chat_response(
+        chat_response: ChatResponse,
+    ) -> Result<Vec<LlmClassification>, LlmError> {
         super::parse_chat_response(ProviderKind::OpenRouter, chat_response)
     }
 }
 
 #[cfg(test)]
 mod provider_defaults_tests {
-    use crate::provider::{ProviderKind, ResolvedProviderConfig};
     use crate::llm::OpenAiClient;
+    use crate::provider::{ProviderKind, ResolvedProviderConfig};
 
     #[test]
     fn openai_client_should_use_openai_chat_endpoint() {

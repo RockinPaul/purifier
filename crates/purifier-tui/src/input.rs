@@ -1,5 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent, MouseEventKind};
 use purifier_core::provider::{default_provider_settings, ProviderKind};
+use purifier_core::size::SizeMode;
 use ratatui::layout::Rect;
 
 use crate::app::{App, AppModal, AppScreen, ScanStatus, SettingsDraft, View};
@@ -30,6 +31,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> InputResult {
 
 pub fn handle_mouse(app: &mut App, mouse: MouseEvent, layout: MainLayout) {
     if app.modal.is_some() || !matches!(app.screen, AppScreen::Main) {
+        return;
+    }
+
+    if app.scan_status == ScanStatus::Scanning {
         return;
     }
 
@@ -142,6 +147,13 @@ fn handle_custom_input(app: &mut App, key: KeyEvent) -> InputResult {
 }
 
 fn handle_main(app: &mut App, key: KeyEvent) {
+    if app.scan_status == ScanStatus::Scanning {
+        if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
+            app.should_quit = true;
+        }
+        return;
+    }
+
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
         KeyCode::Char('1') => app.switch_view(View::BySize),
@@ -281,6 +293,18 @@ fn handle_settings_modal(app: &mut App, key: KeyEvent) -> InputResult {
             app.settings_modal_error = None;
             app.last_error = None;
         }
+        KeyCode::Char('m') => {
+            draft.size_mode = match draft.size_mode {
+                SizeMode::Physical => SizeMode::Logical,
+                SizeMode::Logical => SizeMode::Physical,
+            };
+        }
+        KeyCode::Char('p') => {
+            draft.selected_scan_profile = next_scan_profile_name(
+                &app.preferences.ui.scan_profiles,
+                draft.selected_scan_profile.as_deref(),
+            );
+        }
         _ => {}
     }
 
@@ -300,13 +324,43 @@ fn apply_provider_defaults(
     draft.base_url = settings.base_url;
 }
 
+fn next_scan_profile_name(
+    profiles: &[purifier_core::ScanProfile],
+    current: Option<&str>,
+) -> Option<String> {
+    if profiles.is_empty() {
+        return None;
+    }
+
+    let next_index = current
+        .and_then(|selected| profiles.iter().position(|profile| profile.name == selected))
+        .map_or(0, |index| (index + 1) % (profiles.len() + 1));
+
+    if next_index == profiles.len() {
+        None
+    } else {
+        Some(profiles[next_index].name.clone())
+    }
+}
+
 fn handle_delete_confirm(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') => {
             if let Some(flat) = app.selected_entry().cloned() {
                 match purifier_core::delete_entry(&flat.path) {
-                    Ok(freed) => {
-                        app.freed_space += freed;
+                    Ok(outcome) => {
+                        app.delete_stats.logical_bytes_removed += outcome.logical_bytes_removed;
+                        app.delete_stats.physical_bytes_estimated +=
+                            outcome.physical_bytes_estimated;
+                        app.delete_stats.physical_bytes_freed += outcome.physical_bytes_freed;
+                        app.total_logical_size = app
+                            .total_logical_size
+                            .saturating_sub(outcome.logical_bytes_removed);
+                        app.total_physical_size = app
+                            .total_physical_size
+                            .saturating_sub(outcome.physical_bytes_estimated);
+                        app.sync_display_size_state();
+                        app.total_files = app.total_files.saturating_sub(outcome.entries_removed);
                         app.last_error = None;
                         app.mark_deleted(&flat.path);
                         app.remove_entry_by_path(&flat.path);
@@ -336,9 +390,13 @@ fn handle_delete_confirm(app: &mut App, key: KeyEvent) {
 mod tests {
     use std::path::PathBuf;
 
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
+    use purifier_core::size::EntrySizes;
     use purifier_core::types::FileEntry;
 
     use super::{handle_key, handle_mouse};
@@ -402,6 +460,155 @@ mod tests {
             app.modal.is_none(),
             "confirmation should close after handling"
         );
+    }
+
+    #[test]
+    fn confirm_delete_should_track_logical_removed_and_physical_freed_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let file_path = dir.path().join("delete-me.bin");
+        std::fs::write(&file_path, vec![0_u8; 8192]).expect("test file should be written");
+
+        let mut app = App::new(
+            Some(PathBuf::from("/")),
+            false,
+            crate::config::AppConfig::default(),
+        );
+        app.entries = vec![FileEntry::new_with_sizes(
+            file_path.clone(),
+            EntrySizes {
+                logical_bytes: 8192,
+                physical_bytes: 8192,
+                accounted_physical_bytes: 8192,
+            },
+            None,
+            false,
+            None,
+        )];
+        app.rebuild_flat_entries();
+        app.open_delete_confirm();
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        );
+
+        assert!(
+            app.entries.is_empty(),
+            "successful delete should remove entry"
+        );
+        assert_eq!(app.delete_stats.logical_bytes_removed, 8192);
+        assert!(
+            app.delete_stats.physical_bytes_freed > 0
+                || app.delete_stats.physical_bytes_estimated > 0,
+            "successful delete should keep physical freed-space information visible"
+        );
+        assert!(
+            !file_path.exists(),
+            "file should be removed from disk after confirmation"
+        );
+    }
+
+    #[test]
+    fn confirm_delete_should_update_total_size_and_file_count() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let file_path = dir.path().join("delete-me.bin");
+        std::fs::write(&file_path, vec![0_u8; 8192]).expect("test file should be written");
+
+        let mut app = App::new(
+            Some(PathBuf::from("/")),
+            false,
+            crate::config::AppConfig::default(),
+        );
+        app.entries = vec![
+            FileEntry::new_with_sizes(
+                file_path.clone(),
+                EntrySizes {
+                    logical_bytes: 8192,
+                    physical_bytes: 8192,
+                    accounted_physical_bytes: 8192,
+                },
+                None,
+                false,
+                None,
+            ),
+            FileEntry::new(PathBuf::from("/keep"), 1024, false, None),
+        ];
+        app.total_logical_size = 9216;
+        app.total_physical_size = 9216;
+        app.sync_display_size_state();
+        app.total_files = 2;
+        app.rebuild_flat_entries();
+        app.selected_index = 0;
+        app.open_delete_confirm();
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        );
+
+        assert_eq!(app.total_size, 1024);
+        assert_eq!(app.total_files, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confirm_delete_should_keep_physical_total_when_other_hard_links_survive() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let original = dir.path().join("file.txt");
+        let linked = dir.path().join("file-copy.txt");
+        std::fs::write(&original, b"hello").expect("file should be written");
+        std::fs::hard_link(&original, &linked).expect("hard link should be created");
+
+        let physical = std::fs::metadata(&original)
+            .expect("metadata should load")
+            .blocks()
+            * 512;
+
+        let mut app = App::new(
+            Some(PathBuf::from("/")),
+            false,
+            crate::config::AppConfig::default(),
+        );
+        app.entries = vec![
+            FileEntry::new_with_sizes(
+                original.clone(),
+                EntrySizes {
+                    logical_bytes: 5,
+                    physical_bytes: physical,
+                    accounted_physical_bytes: physical,
+                },
+                None,
+                false,
+                None,
+            ),
+            FileEntry::new_with_sizes(
+                linked.clone(),
+                EntrySizes {
+                    logical_bytes: 5,
+                    physical_bytes: physical,
+                    accounted_physical_bytes: 0,
+                },
+                None,
+                false,
+                None,
+            ),
+        ];
+        app.total_logical_size = 10;
+        app.total_physical_size = physical;
+        app.sync_display_size_state();
+        app.total_files = 2;
+        app.rebuild_flat_entries();
+        app.selected_index = 0;
+        app.open_delete_confirm();
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        );
+
+        assert_eq!(app.total_physical_size, physical);
+        assert_eq!(app.total_logical_size, 5);
+        assert_eq!(app.total_files, 1);
     }
 
     #[test]
@@ -596,6 +803,66 @@ mod tests {
             "centered scan overlay should block wheel scroll"
         );
     }
+
+    #[test]
+    fn scanning_state_should_ignore_main_list_navigation_keys() {
+        let mut app = App::new(
+            Some(PathBuf::from("/")),
+            false,
+            crate::config::AppConfig::default(),
+        );
+        app.scan_status = crate::app::ScanStatus::Scanning;
+        app.entries = vec![
+            FileEntry::new(PathBuf::from("/a"), 3, false, None),
+            FileEntry::new(PathBuf::from("/b"), 2, false, None),
+        ];
+        app.rebuild_flat_entries();
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+        );
+
+        assert_eq!(
+            app.selected_index, 0,
+            "keyboard navigation should stay blocked while scanning"
+        );
+        assert!(
+            app.modal.is_none(),
+            "delete confirm should stay closed while scanning"
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_should_not_move_selection_while_scanning() {
+        let mut app = App::new(
+            Some(PathBuf::from("/")),
+            false,
+            crate::config::AppConfig::default(),
+        );
+        app.scan_status = crate::app::ScanStatus::Scanning;
+        app.entries = vec![
+            FileEntry::new(PathBuf::from("/a"), 3, false, None),
+            FileEntry::new(PathBuf::from("/b"), 2, false, None),
+        ];
+        app.rebuild_flat_entries();
+        let layout = ui::main_layout(ratatui::layout::Rect::new(0, 0, 80, 20));
+
+        handle_mouse(
+            &mut app,
+            scroll_down_at(layout.main.x + 1, layout.main.y + 1),
+            layout,
+        );
+
+        assert_eq!(
+            app.selected_index, 0,
+            "wheel scrolling should stay blocked while scanning"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -715,6 +982,8 @@ mod modal_submit_tests {
             model: "google/gemini-2.0-flash-001".to_string(),
             base_url: "https://openrouter.ai/api/v1".to_string(),
             llm_enabled: true,
+            size_mode: purifier_core::SizeMode::Physical,
+            selected_scan_profile: None,
         }));
 
         let result = handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -741,6 +1010,8 @@ mod modal_submit_tests {
             model: "custom-openrouter-model".to_string(),
             base_url: "https://wrong.example.com".to_string(),
             llm_enabled: true,
+            size_mode: purifier_core::SizeMode::Physical,
+            selected_scan_profile: None,
         }));
 
         handle_key(
@@ -772,6 +1043,8 @@ mod modal_submit_tests {
             model: "google/gemini-2.0-flash-001".to_string(),
             base_url: "https://openrouter.ai/api/v1".to_string(),
             llm_enabled: true,
+            size_mode: purifier_core::SizeMode::Physical,
+            selected_scan_profile: None,
         }));
         app.settings_modal_is_saving = true;
         app.settings_modal_error = Some("still validating".to_string());
@@ -825,6 +1098,8 @@ mod modal_submit_tests {
             model: "google/gemini-2.0-flash-001".to_string(),
             base_url: "https://openrouter.ai/api/v1".to_string(),
             llm_enabled: true,
+            size_mode: purifier_core::SizeMode::Physical,
+            selected_scan_profile: None,
         }));
         app.settings_modal_error = Some("inline error".to_string());
         app.last_error = Some("inline error".to_string());
@@ -858,6 +1133,8 @@ mod modal_submit_tests {
             model: "google/gemini-2.0-flash-001".to_string(),
             base_url: "https://openrouter.ai/api/v1".to_string(),
             llm_enabled: true,
+            size_mode: purifier_core::SizeMode::Physical,
+            selected_scan_profile: None,
         }));
         app.settings_modal_error = Some("inline error".to_string());
         app.last_error = Some("inline error".to_string());
@@ -895,6 +1172,8 @@ mod modal_submit_tests {
             model: "custom-openrouter-model".to_string(),
             base_url: "https://wrong.example.com".to_string(),
             llm_enabled: true,
+            size_mode: purifier_core::SizeMode::Physical,
+            selected_scan_profile: None,
         }));
 
         handle_key(
@@ -925,6 +1204,8 @@ mod modal_submit_tests {
             model: "google/gemini-2.0-flash-001".to_string(),
             base_url: "https://openrouter.ai/api/v1".to_string(),
             llm_enabled: true,
+            size_mode: purifier_core::SizeMode::Physical,
+            selected_scan_profile: None,
         }));
 
         handle_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
@@ -957,6 +1238,8 @@ mod modal_submit_tests {
             model: "google/gemini-2.0-flash-001".to_string(),
             base_url: "https://openrouter.ai/api/v1".to_string(),
             llm_enabled: true,
+            size_mode: purifier_core::SizeMode::Physical,
+            selected_scan_profile: None,
         }));
 
         handle_key(
@@ -982,6 +1265,45 @@ mod modal_submit_tests {
     }
 
     #[test]
+    fn settings_modal_shortcuts_should_update_size_mode_and_selected_profile() {
+        let mut config = AppConfig::default();
+        config.ui.scan_profiles = vec![
+            purifier_core::ScanProfile {
+                name: "exclude-node-modules".to_string(),
+                exclude: None,
+                mask: None,
+                display_filter: None,
+            },
+            purifier_core::ScanProfile {
+                name: "cache-only".to_string(),
+                exclude: None,
+                mask: None,
+                display_filter: None,
+            },
+        ];
+        let mut app = App::new(Some(std::path::PathBuf::from("/")), true, config);
+        app.open_settings();
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+        );
+
+        let Some(AppModal::Settings(draft)) = app.modal.as_ref() else {
+            panic!("settings modal should stay open");
+        };
+        assert_eq!(draft.size_mode, purifier_core::SizeMode::Logical);
+        assert_eq!(
+            draft.selected_scan_profile.as_deref(),
+            Some("exclude-node-modules")
+        );
+    }
+
+    #[test]
     fn save_should_not_claim_live_llm_ready_without_runtime_client() {
         let mut app = App::new(
             Some(std::path::PathBuf::from("/")),
@@ -997,6 +1319,8 @@ mod modal_submit_tests {
             model: "google/gemini-2.0-flash-001".to_string(),
             base_url: "https://openrouter.ai/api/v1".to_string(),
             llm_enabled: true,
+            size_mode: purifier_core::SizeMode::Physical,
+            selected_scan_profile: None,
         }));
 
         handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -1020,6 +1344,8 @@ mod modal_submit_tests {
             model: "google/gemini-2.0-flash-001".to_string(),
             base_url: "https://openrouter.ai/api/v1".to_string(),
             llm_enabled: true,
+            size_mode: purifier_core::SizeMode::Physical,
+            selected_scan_profile: None,
         }));
 
         let result = handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -1048,6 +1374,8 @@ mod modal_submit_tests {
             model: "google/gemini-2.0-flash-001".to_string(),
             base_url: "https://openrouter.ai/api/v1".to_string(),
             llm_enabled: true,
+            size_mode: purifier_core::SizeMode::Physical,
+            selected_scan_profile: None,
         }));
 
         let result = handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
@@ -1073,6 +1401,8 @@ mod modal_submit_tests {
             model: "google/gemini-2.0-flash-001".to_string(),
             base_url: "https://openrouter.ai/api/v1".to_string(),
             llm_enabled: true,
+            size_mode: purifier_core::SizeMode::Physical,
+            selected_scan_profile: None,
         }));
 
         handle_key(
@@ -1098,6 +1428,8 @@ mod modal_submit_tests {
             model: "gpt-4o-mini".to_string(),
             base_url: "https://api.openai.com/v1".to_string(),
             llm_enabled: true,
+            size_mode: purifier_core::SizeMode::Physical,
+            selected_scan_profile: None,
         }));
 
         handle_key(

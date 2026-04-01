@@ -3,6 +3,8 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
+use crate::size::{EntrySizes, FileIdentity, SizeMode};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Category {
     BuildArtifact,
@@ -50,7 +52,8 @@ impl std::fmt::Display for SafetyLevel {
 #[derive(Debug, Clone)]
 pub struct FileEntry {
     pub path: PathBuf,
-    pub size: u64,
+    pub sizes: EntrySizes,
+    pub file_identity: Option<FileIdentity>,
     pub is_dir: bool,
     pub modified: Option<SystemTime>,
     pub category: Category,
@@ -64,7 +67,12 @@ impl FileEntry {
     pub fn new(path: PathBuf, size: u64, is_dir: bool, modified: Option<SystemTime>) -> Self {
         Self {
             path,
-            size,
+            sizes: EntrySizes {
+                logical_bytes: size,
+                physical_bytes: size,
+                accounted_physical_bytes: size,
+            },
+            file_identity: None,
             is_dir,
             modified,
             category: Category::Unknown,
@@ -75,11 +83,32 @@ impl FileEntry {
         }
     }
 
-    pub fn total_size(&self) -> u64 {
+    pub fn new_with_sizes(
+        path: PathBuf,
+        sizes: EntrySizes,
+        file_identity: Option<FileIdentity>,
+        is_dir: bool,
+        modified: Option<SystemTime>,
+    ) -> Self {
+        Self {
+            path,
+            sizes,
+            file_identity,
+            is_dir,
+            modified,
+            category: Category::Unknown,
+            safety: SafetyLevel::Unknown,
+            safety_reason: String::new(),
+            children: Vec::new(),
+            expanded: false,
+        }
+    }
+
+    pub fn total_size(&self, mode: SizeMode) -> u64 {
         if self.children.is_empty() {
-            self.size
+            self.sizes.accounted_total_bytes(mode)
         } else {
-            self.children.iter().map(|c| c.total_size()).sum()
+            self.children.iter().map(|c| c.total_size(mode)).sum()
         }
     }
 }
@@ -88,18 +117,68 @@ impl FileEntry {
 pub enum ScanEvent {
     Entry {
         path: PathBuf,
-        size: u64,
+        sizes: EntrySizes,
+        file_identity: Option<FileIdentity>,
         is_dir: bool,
         modified: Option<SystemTime>,
     },
     Progress {
-        files_scanned: u64,
-        bytes_found: u64,
-        current_dir: String,
+        entries_scanned: u64,
+        logical_bytes_found: u64,
+        physical_bytes_found: u64,
+        current_path: String,
     },
     ScanComplete {
-        total_size: u64,
-        total_files: u64,
+        total_entries: u64,
+        total_logical_bytes: u64,
+        total_physical_bytes: u64,
         skipped: u64,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn physical_total_size_should_use_accounted_physical_bytes_for_leaf_entries() {
+        let entry = FileEntry::new_with_sizes(
+            PathBuf::from("/tmp/file"),
+            EntrySizes {
+                logical_bytes: 100,
+                physical_bytes: 4096,
+                accounted_physical_bytes: 0,
+            },
+            None,
+            false,
+            None,
+        );
+
+        assert_eq!(entry.total_size(SizeMode::Physical), 0);
+    }
+
+    #[test]
+    fn new_with_sizes_should_preserve_identity_and_sizes() {
+        let sizes = EntrySizes {
+            logical_bytes: 10,
+            physical_bytes: 4096,
+            accounted_physical_bytes: 4096,
+        };
+        let identity = FileIdentity {
+            dev: 7,
+            ino: 42,
+            nlink: 3,
+        };
+
+        let entry = FileEntry::new_with_sizes(
+            PathBuf::from("/tmp/file"),
+            sizes,
+            Some(identity),
+            false,
+            None,
+        );
+
+        assert_eq!(entry.sizes, sizes);
+        assert_eq!(entry.file_identity, Some(identity));
+    }
 }

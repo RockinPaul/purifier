@@ -121,7 +121,7 @@ fn draw_delete_confirm(frame: &mut Frame, app: &App) {
     use ratatui::text::{Line, Span};
     use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
-    let popup_area = centered_popup_area(frame.area(), 60, 8);
+    let popup_area = centered_popup_area(frame.area(), 60, 9);
 
     frame.render_widget(Clear, popup_area);
 
@@ -142,8 +142,12 @@ fn draw_delete_confirm(frame: &mut Frame, app: &App) {
                 ),
             ]),
             Line::from(vec![
-                Span::raw("Size: "),
-                Span::raw(format_size(entry.size)),
+                Span::raw("Logical remove: "),
+                Span::raw(format_size(entry.logical_size)),
+            ]),
+            Line::from(vec![
+                Span::raw("Est. physical free: "),
+                Span::raw(format_size(entry.physical_size)),
             ]),
             Line::from(vec![
                 Span::raw("Safety: "),
@@ -227,7 +231,27 @@ pub fn truncate_tail(input: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
     use super::*;
+    use purifier_core::size::EntrySizes;
+    use purifier_core::types::FileEntry;
+
+    fn render_app(app: &App) -> String {
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).expect("terminal should be created");
+        terminal
+            .draw(|frame| draw(frame, app))
+            .expect("ui should render");
+
+        let buffer = terminal.backend().buffer().clone();
+        buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+    }
 
     #[test]
     fn truncate_start_should_preserve_unicode_boundaries() {
@@ -256,5 +280,37 @@ mod tests {
         app.open_delete_confirm();
 
         assert!(global_overlay_modal(&app).is_none());
+    }
+
+    #[test]
+    fn delete_confirm_should_show_logical_and_estimated_physical_sizes() {
+        let mut app = App::new(
+            Some(std::path::PathBuf::from("/")),
+            false,
+            crate::config::AppConfig::default(),
+        );
+        app.entries = vec![FileEntry::new_with_sizes(
+            std::path::PathBuf::from("/tmp/delete-me.bin"),
+            EntrySizes {
+                logical_bytes: 1024,
+                physical_bytes: 4096,
+                accounted_physical_bytes: 4096,
+            },
+            None,
+            false,
+            None,
+        )];
+        app.rebuild_flat_entries();
+        app.open_delete_confirm();
+        let text = render_app(&app);
+
+        assert!(
+            text.contains("Logical remove: 1.0 KB"),
+            "delete confirm should describe logical removal explicitly: {text}"
+        );
+        assert!(
+            text.contains("Est. physical free: 4.0 KB"),
+            "delete confirm should describe estimated physical free space: {text}"
+        );
     }
 }

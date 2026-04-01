@@ -1201,6 +1201,7 @@ dependencies = [
  "dirs",
  "glob",
  "jwalk",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",

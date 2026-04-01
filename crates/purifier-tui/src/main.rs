@@ -4,7 +4,7 @@ mod input;
 mod secrets;
 mod ui;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -26,6 +26,7 @@ use purifier_core::provider::{
 };
 use purifier_core::rules::RulesEngine;
 use purifier_core::scanner;
+use purifier_core::size::SizeMode;
 use purifier_core::types::{FileEntry, SafetyLevel, ScanEvent};
 
 use app::SettingsDraft;
@@ -34,12 +35,43 @@ use input::InputResult;
 use secrets::{KeychainSecretStore, SecretStore};
 
 /// Max scan events to process per frame to prevent input starvation
+#[cfg_attr(not(test), allow(dead_code))]
 const MAX_EVENTS_PER_FRAME: usize = 1000;
+#[cfg_attr(not(test), allow(dead_code))]
 const LLM_BATCH_SIZE: usize = 50;
 
 type UnknownBatchSender = crossbeam_channel::Sender<Vec<UnknownEntry>>;
 type LlmResultReceiver = crossbeam_channel::Receiver<Vec<LlmClassification>>;
 type RuntimeConnectionReceiver = crossbeam_channel::Receiver<RuntimeConnectionEvent>;
+
+struct ActiveScan {
+    updates: crossbeam_channel::Receiver<ScanProcessingUpdate>,
+    cancel: crossbeam_channel::Sender<()>,
+}
+
+#[derive(Debug)]
+struct ScanProgressSnapshot {
+    entries_scanned: u64,
+    logical_bytes_found: u64,
+    physical_bytes_found: u64,
+    current_path: String,
+}
+
+#[derive(Debug)]
+struct CompletedScanResult {
+    entries: Vec<FileEntry>,
+    total_entries: u64,
+    total_logical_bytes: u64,
+    total_physical_bytes: u64,
+    skipped: u64,
+}
+
+#[derive(Debug)]
+enum ScanProcessingUpdate {
+    Progress(ScanProgressSnapshot),
+    UnknownBatch(Vec<UnknownEntry>),
+    Complete(CompletedScanResult),
+}
 
 enum RuntimeConnectionEvent {
     Validated {
@@ -153,6 +185,7 @@ fn main() -> io::Result<()> {
         .as_deref()
         .map(normalize_scan_path)
         .and_then(validate_scan_path);
+    let initial_scan_profile = resolve_initial_scan_profile(cli.path.as_deref(), &saved_config);
 
     // Setup terminal
     enable_raw_mode()?;
@@ -175,11 +208,19 @@ fn main() -> io::Result<()> {
         app.open_onboarding();
     }
 
-    let mut scan_rx: Option<crossbeam_channel::Receiver<ScanEvent>> = None;
+    let mut scan_rx: Option<ActiveScan> = None;
 
     if let Some(path) = initial_scan_path {
         app.scan_status = ScanStatus::Scanning;
-        scan_rx = Some(scanner::scan(&path));
+        app.applied_scan_profile_name = initial_scan_profile
+            .as_ref()
+            .map(|profile| profile.name.clone());
+        scan_rx = Some(start_scan_processing(
+            path.clone(),
+            scanner::scan_with_profile(&path, initial_scan_profile),
+            classifier_rules(&classifier),
+            should_mark_unknowns_pending(&app),
+        ));
     }
 
     // Main loop
@@ -217,78 +258,48 @@ fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
     classifier: &mut Classifier,
-    scan_rx: &mut Option<crossbeam_channel::Receiver<ScanEvent>>,
+    scan_rx: &mut Option<ActiveScan>,
     runtime_connection_rx: &mut Option<RuntimeConnectionReceiver>,
     config_path: &Path,
     secrets: &mut impl SecretStore,
     session: SessionContext<'_>,
 ) -> io::Result<()> {
-    let mut path_children: HashMap<PathBuf, Vec<FileEntry>> = HashMap::new();
     let (mut unknown_tx, mut llm_result_rx) = start_llm_processing(classifier, app);
-    let mut pending_unknowns = Vec::new();
+    let mut buffered_unknown_batches: Vec<Vec<UnknownEntry>> = Vec::new();
+    let mut buffered_llm_results: Vec<LlmClassification> = Vec::new();
 
     loop {
         terminal.draw(|frame| ui::draw(frame, app))?;
 
-        // Process scan events — capped per frame to prevent input starvation
+        // Process scan updates — capped per frame to keep input responsive.
+        let mut scan_completed = false;
         if let Some(rx) = scan_rx.as_ref() {
             let mut processed = 0;
             while processed < MAX_EVENTS_PER_FRAME {
-                match rx.try_recv() {
+                match rx.updates.try_recv() {
                     Ok(event) => {
                         match event {
-                            ScanEvent::Entry {
-                                path,
-                                size,
-                                is_dir,
-                                modified,
-                            } => {
-                                let mut entry =
-                                    FileEntry::new(path.clone(), size, is_dir, modified);
-                                classifier.classify_entry(&mut entry);
-                                queue_unknown_entry(
-                                    &mut entry,
-                                    &mut pending_unknowns,
-                                    unknown_tx.as_ref(),
-                                    matches!(app.llm_status, LlmStatus::Connecting(_)),
-                                );
-
-                                if let Some(parent) = path.parent() {
-                                    path_children
-                                        .entry(parent.to_path_buf())
-                                        .or_default()
-                                        .push(entry);
+                            ScanProcessingUpdate::UnknownBatch(batch) => {
+                                if let Some(tx) = unknown_tx.as_ref() {
+                                    let _ = tx.send(batch);
                                 } else {
-                                    app.entries.push(entry);
+                                    buffered_unknown_batches.push(batch);
                                 }
                             }
-                            ScanEvent::Progress {
-                                files_scanned,
-                                bytes_found,
-                                current_dir,
-                            } => {
-                                app.files_scanned = files_scanned;
-                                app.bytes_found = bytes_found;
-                                app.current_scan_dir = current_dir;
-                            }
-                            ScanEvent::ScanComplete {
-                                total_size,
-                                total_files,
-                                skipped,
-                            } => {
-                                flush_pending_unknowns(&mut pending_unknowns, unknown_tx.as_ref());
-                                app.scan_status = ScanStatus::Complete;
-                                app.total_size = total_size;
-                                app.total_files = total_files;
-                                app.skipped = skipped;
-
-                                app.entries = build_tree(
-                                    &app.scan_path,
-                                    &mut path_children,
-                                    &app.expanded_paths,
-                                    &app.deleted_paths,
-                                );
-                                app.rebuild_flat_entries();
+                            other => {
+                                if apply_scan_update(app, other) {
+                                    if !buffered_llm_results.is_empty() {
+                                        apply_llm_results(
+                                            app,
+                                            std::mem::take(&mut buffered_llm_results),
+                                        );
+                                    }
+                                    if unknown_tx.is_none() && !should_mark_unknowns_pending(app) {
+                                        buffered_unknown_batches.clear();
+                                        reset_pending_llm_labels_in_state(app);
+                                    }
+                                    scan_completed = true;
+                                }
                             }
                         }
                         processed += 1;
@@ -296,15 +307,19 @@ fn run_loop(
                     Err(_) => break, // channel empty or disconnected
                 }
             }
+        }
 
-            if processed > 0 && app.scan_status == ScanStatus::Scanning {
-                refresh_scan_snapshot(app, &path_children);
-            }
+        if scan_completed {
+            *scan_rx = None;
         }
 
         if let Some(result_rx) = llm_result_rx.as_ref() {
             while let Ok(results) = result_rx.try_recv() {
-                apply_llm_results(&mut path_children, app, results);
+                if app.scan_status == ScanStatus::Scanning && app.entries.is_empty() {
+                    buffered_llm_results.extend(results);
+                } else {
+                    apply_llm_results(app, results);
+                }
             }
         }
 
@@ -314,12 +329,13 @@ fn run_loop(
         if let Some(event) = connection_event {
             apply_runtime_connection_event(app, classifier, event);
             *runtime_connection_rx = None;
-            pending_unknowns.clear();
             (unknown_tx, llm_result_rx) = start_llm_processing(classifier, app);
             if unknown_tx.is_some() {
+                flush_unknown_batches(&mut buffered_unknown_batches, unknown_tx.as_ref());
                 requeue_unknown_entries_for_visible_tree(app, unknown_tx.as_ref());
             } else {
-                reset_pending_llm_labels_in_state(app, &mut path_children);
+                buffered_unknown_batches.clear();
+                reset_pending_llm_labels_in_state(app);
             }
         }
 
@@ -331,10 +347,27 @@ fn run_loop(
                         InputResult::StartScan(path) => {
                             // User selected a directory from picker — start scanning
                             let path = normalize_scan_path(&path);
-                            path_children.clear();
-                            pending_unknowns.clear();
                             app.scan_path = path.clone();
-                            *scan_rx = Some(scanner::scan(&path));
+                            let scan_profile = app.preferences.active_scan_profile().cloned();
+                            app.applied_scan_profile_name =
+                                scan_profile.as_ref().map(|profile| profile.name.clone());
+                            if let Some(active_scan) = scan_rx.take() {
+                                let _ = active_scan.cancel.send(());
+                            }
+                            *scan_rx = Some(start_scan_processing(
+                                path.clone(),
+                                scanner::scan_with_profile(&path, scan_profile),
+                                classifier_rules(classifier),
+                                should_mark_unknowns_pending(app),
+                            ));
+                            restart_llm_processing_for_new_scan(
+                                classifier,
+                                app,
+                                &mut unknown_tx,
+                                &mut llm_result_rx,
+                                &mut buffered_unknown_batches,
+                                &mut buffered_llm_results,
+                            );
                         }
                         InputResult::SaveSettings(draft) => {
                             if apply_settings_save(
@@ -349,15 +382,18 @@ fn run_loop(
                             )
                             .is_ok()
                             {
-                                pending_unknowns.clear();
                                 (unknown_tx, llm_result_rx) = start_llm_processing(classifier, app);
                                 if unknown_tx.is_some() {
+                                    flush_unknown_batches(
+                                        &mut buffered_unknown_batches,
+                                        unknown_tx.as_ref(),
+                                    );
                                     requeue_unknown_entries_for_visible_tree(
                                         app,
                                         unknown_tx.as_ref(),
                                     );
                                 } else {
-                                    reset_pending_llm_labels_in_state(app, &mut path_children);
+                                    reset_pending_llm_labels_in_state(app);
                                 }
                             }
                         }
@@ -375,6 +411,9 @@ fn run_loop(
                         InputResult::None => {}
                     }
                     if app.should_quit {
+                        if let Some(active_scan) = scan_rx.take() {
+                            let _ = active_scan.cancel.send(());
+                        }
                         return Ok(());
                     }
                 }
@@ -406,6 +445,8 @@ fn apply_settings_save(
 ) -> Result<(), Box<dyn std::error::Error>> {
     match persist_settings(config_path, &mut app.preferences, draft.clone(), secrets) {
         Ok(()) => {
+            app.sync_display_size_state();
+            app.rebuild_flat_entries();
             let runtime_override_active =
                 refresh_runtime_state(app, classifier, runtime_connection_rx, secrets, cli, env);
 
@@ -534,6 +575,8 @@ fn persist_settings(
     let mut updated = preferences.clone();
     updated.llm.enabled = draft.llm_enabled;
     updated.llm.active_provider = draft.provider;
+    updated.ui.size_mode = draft.size_mode;
+    updated.ui.last_selected_scan_profile = draft.selected_scan_profile.clone();
     updated.llm.providers.insert(
         draft.provider,
         purifier_core::provider::ProviderSettings {
@@ -1025,6 +1068,17 @@ fn resolve_initial_scan_path(
         })
 }
 
+fn resolve_initial_scan_profile(
+    cli_path: Option<&Path>,
+    config: &config::AppConfig,
+) -> Option<purifier_core::ScanProfile> {
+    if cli_path.is_some() {
+        None
+    } else {
+        config.active_scan_profile().cloned()
+    }
+}
+
 fn start_llm_processing(
     classifier: &Classifier,
     app: &mut App,
@@ -1040,6 +1094,155 @@ fn start_llm_processing(
     (Some(unknown_tx), Some(result_rx))
 }
 
+fn restart_llm_processing_for_new_scan(
+    classifier: &Classifier,
+    app: &mut App,
+    unknown_tx: &mut Option<UnknownBatchSender>,
+    llm_result_rx: &mut Option<LlmResultReceiver>,
+    buffered_unknown_batches: &mut Vec<Vec<UnknownEntry>>,
+    buffered_llm_results: &mut Vec<LlmClassification>,
+) {
+    buffered_unknown_batches.clear();
+    buffered_llm_results.clear();
+    *unknown_tx = None;
+    *llm_result_rx = None;
+    (*unknown_tx, *llm_result_rx) = start_llm_processing(classifier, app);
+}
+
+fn start_scan_processing(
+    scan_root: PathBuf,
+    scan_rx: crossbeam_channel::Receiver<ScanEvent>,
+    rules: RulesEngine,
+    mark_unknown_pending: bool,
+) -> ActiveScan {
+    let (update_tx, updates) = crossbeam_channel::unbounded();
+    let (cancel, cancel_rx) = crossbeam_channel::bounded(1);
+
+    std::thread::spawn(move || {
+        let mut path_children: HashMap<PathBuf, Vec<FileEntry>> = HashMap::new();
+        let mut pending_unknowns = Vec::new();
+
+        loop {
+            crossbeam_channel::select! {
+                recv(cancel_rx) -> _ => break,
+                recv(scan_rx) -> message => match message {
+                    Ok(ScanEvent::Entry {
+                        path,
+                        sizes,
+                        file_identity,
+                        is_dir,
+                        modified,
+                    }) => {
+                        let mut entry = FileEntry::new_with_sizes(
+                            path.clone(),
+                            sizes,
+                            file_identity,
+                            is_dir,
+                            modified,
+                        );
+                        classify_entry_with_rules(&rules, &mut entry);
+                        queue_scan_unknown_entry(
+                            &mut entry,
+                            &mut pending_unknowns,
+                            &update_tx,
+                            mark_unknown_pending,
+                        );
+
+                        if let Some(parent) = path.parent() {
+                            path_children
+                                .entry(parent.to_path_buf())
+                                .or_default()
+                                .push(entry);
+                        }
+                    }
+                    Ok(ScanEvent::Progress {
+                        entries_scanned,
+                        logical_bytes_found,
+                        physical_bytes_found,
+                        current_path,
+                    }) => {
+                        if update_tx
+                            .send(ScanProcessingUpdate::Progress(ScanProgressSnapshot {
+                                entries_scanned,
+                                logical_bytes_found,
+                                physical_bytes_found,
+                                current_path,
+                            }))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Ok(ScanEvent::ScanComplete {
+                        total_entries,
+                        total_logical_bytes,
+                        total_physical_bytes,
+                        skipped,
+                    }) => {
+                        flush_scan_unknown_batches(&mut pending_unknowns, &update_tx);
+                        let entries = build_tree(
+                            &scan_root,
+                            &mut path_children,
+                            &HashSet::new(),
+                            &HashSet::new(),
+                        );
+
+                        let _ = update_tx.send(ScanProcessingUpdate::Complete(CompletedScanResult {
+                            entries,
+                            total_entries,
+                            total_logical_bytes,
+                            total_physical_bytes,
+                            skipped,
+                        }));
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    });
+
+    ActiveScan { updates, cancel }
+}
+
+fn classifier_rules(classifier: &Classifier) -> RulesEngine {
+    classifier.rules().clone()
+}
+
+fn apply_scan_update(app: &mut App, update: ScanProcessingUpdate) -> bool {
+    match update {
+        ScanProcessingUpdate::Progress(progress) => {
+            app.files_scanned = progress.entries_scanned;
+            app.logical_bytes_found = progress.logical_bytes_found;
+            app.physical_bytes_found = progress.physical_bytes_found;
+            app.sync_display_size_state();
+            app.current_scan_dir = progress.current_path;
+            false
+        }
+        ScanProcessingUpdate::UnknownBatch(_) => false,
+        ScanProcessingUpdate::Complete(result) => {
+            app.scan_status = ScanStatus::Complete;
+            app.total_logical_size = result.total_logical_bytes;
+            app.total_physical_size = result.total_physical_bytes;
+            app.sync_display_size_state();
+            app.total_files = result.total_entries;
+            app.skipped = result.skipped;
+            app.entries = result.entries;
+            app.rebuild_flat_entries();
+            true
+        }
+    }
+}
+
+fn classify_entry_with_rules(rules: &RulesEngine, entry: &mut FileEntry) {
+    if let Some(rule_match) = rules.classify(&entry.path) {
+        entry.category = rule_match.category;
+        entry.safety = rule_match.safety;
+        entry.safety_reason = rule_match.reason;
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 fn queue_unknown_entry(
     entry: &mut FileEntry,
     pending_unknowns: &mut Vec<UnknownEntry>,
@@ -1057,7 +1260,7 @@ fn queue_unknown_entry(
     if let Some(tx) = unknown_tx {
         pending_unknowns.push(UnknownEntry {
             path: entry.path.clone(),
-            size: entry.size,
+            size: entry.total_size(SizeMode::Logical),
             is_dir: entry.is_dir,
             age_days: entry.modified.and_then(age_in_days),
         });
@@ -1088,6 +1291,65 @@ fn requeue_unknown_entries_for_visible_tree(
     app.rebuild_flat_entries();
 }
 
+fn flush_unknown_batches(
+    buffered_unknown_batches: &mut Vec<Vec<UnknownEntry>>,
+    unknown_tx: Option<&UnknownBatchSender>,
+) {
+    let Some(tx) = unknown_tx else {
+        return;
+    };
+
+    for batch in buffered_unknown_batches.drain(..) {
+        let _ = tx.send(batch);
+    }
+}
+
+fn queue_scan_unknown_entry(
+    entry: &mut FileEntry,
+    pending_unknowns: &mut Vec<UnknownEntry>,
+    update_tx: &crossbeam_channel::Sender<ScanProcessingUpdate>,
+    mark_unknown_pending: bool,
+) {
+    if entry.safety != SafetyLevel::Unknown {
+        return;
+    }
+
+    if mark_unknown_pending {
+        entry.safety_reason = "Analyzing with LLM...".to_string();
+    }
+
+    pending_unknowns.push(UnknownEntry {
+        path: entry.path.clone(),
+        size: entry.total_size(SizeMode::Logical),
+        is_dir: entry.is_dir,
+        age_days: entry.modified.and_then(age_in_days),
+    });
+
+    if pending_unknowns.len() >= LLM_BATCH_SIZE {
+        let batch = pending_unknowns.drain(..LLM_BATCH_SIZE).collect();
+        let _ = update_tx.send(ScanProcessingUpdate::UnknownBatch(batch));
+    }
+}
+
+fn flush_scan_unknown_batches(
+    pending_unknowns: &mut Vec<UnknownEntry>,
+    update_tx: &crossbeam_channel::Sender<ScanProcessingUpdate>,
+) {
+    if pending_unknowns.is_empty() {
+        return;
+    }
+
+    let batch = std::mem::take(pending_unknowns);
+    let _ = update_tx.send(ScanProcessingUpdate::UnknownBatch(batch));
+}
+
+fn should_mark_unknowns_pending(app: &App) -> bool {
+    !matches!(
+        app.llm_status,
+        LlmStatus::Disabled | LlmStatus::NeedsSetup | LlmStatus::Error(_)
+    )
+}
+
 fn mark_unknown_entries_as_pending(entries: &mut [FileEntry]) {
     for entry in entries {
         if entry.safety == SafetyLevel::Unknown {
@@ -1106,58 +1368,19 @@ fn reset_pending_llm_labels(entries: &mut [FileEntry]) {
     }
 }
 
-fn reset_pending_llm_labels_in_state(
-    app: &mut App,
-    path_children: &mut HashMap<PathBuf, Vec<FileEntry>>,
-) {
+fn reset_pending_llm_labels_in_state(app: &mut App) {
     reset_pending_llm_labels(&mut app.entries);
-    for entries in path_children.values_mut() {
-        reset_pending_llm_labels(entries);
-    }
     app.rebuild_flat_entries();
 }
 
-fn flush_pending_unknowns(
-    pending_unknowns: &mut Vec<UnknownEntry>,
-    unknown_tx: Option<&crossbeam_channel::Sender<Vec<UnknownEntry>>>,
-) {
-    if pending_unknowns.is_empty() {
-        return;
-    }
-
-    if let Some(tx) = unknown_tx {
-        let batch = std::mem::take(pending_unknowns);
-        let _ = tx.send(batch);
-    }
-}
-
-fn apply_llm_results(
-    path_children: &mut HashMap<PathBuf, Vec<FileEntry>>,
-    app: &mut App,
-    results: Vec<LlmClassification>,
-) {
+fn apply_llm_results(app: &mut App, results: Vec<LlmClassification>) {
     let mut applied_any = false;
 
     for result in results {
-        let mut applied = false;
-
-        for entries in path_children.values_mut() {
-            if update_entry_classification(entries, &result) {
-                applied = true;
-                break;
-            }
-        }
-
-        if !applied && update_entry_classification(&mut app.entries, &result) {
-            applied = true;
-        }
-
-        applied_any |= applied;
+        applied_any |= update_entry_classification(&mut app.entries, &result);
     }
 
-    if applied_any && app.scan_status == ScanStatus::Scanning {
-        refresh_scan_snapshot(app, path_children);
-    } else if applied_any && !app.entries.is_empty() {
+    if applied_any && app.scan_status != ScanStatus::Scanning && !app.entries.is_empty() {
         app.rebuild_flat_entries();
     }
 }
@@ -1179,6 +1402,7 @@ fn update_entry_classification(entries: &mut [FileEntry], result: &LlmClassifica
     false
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn age_in_days(modified: SystemTime) -> Option<i64> {
     SystemTime::now()
         .duration_since(modified)
@@ -1186,20 +1410,16 @@ fn age_in_days(modified: SystemTime) -> Option<i64> {
         .map(|duration| (duration.as_secs() / 86_400) as i64)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn refresh_scan_snapshot(app: &mut App, path_children: &HashMap<PathBuf, Vec<FileEntry>>) {
     if app.scan_status != ScanStatus::Scanning {
         return;
     }
 
-    app.entries = build_tree_snapshot(
-        &app.scan_path,
-        path_children,
-        &app.expanded_paths,
-        &app.deleted_paths,
-    );
-    app.rebuild_flat_entries();
+    let _ = path_children;
 }
 
+#[allow(dead_code)]
 fn build_tree_snapshot(
     root: &Path,
     path_children: &HashMap<PathBuf, Vec<FileEntry>>,
@@ -1223,11 +1443,11 @@ fn build_tree_snapshot(
                 build_tree_snapshot(&entry.path, path_children, expanded_paths, deleted_paths);
             entry
                 .children
-                .sort_by_key(|child| std::cmp::Reverse(child.total_size()));
+                .sort_by_key(|child| std::cmp::Reverse(child.total_size(SizeMode::Logical)));
         }
     }
 
-    entries.sort_by_key(|entry| std::cmp::Reverse(entry.total_size()));
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.total_size(SizeMode::Logical)));
     entries
 }
 
@@ -1250,11 +1470,11 @@ fn build_tree(
             entry.children = build_tree(&entry.path, path_children, expanded_paths, deleted_paths);
             entry
                 .children
-                .sort_by_key(|child| std::cmp::Reverse(child.total_size()));
+                .sort_by_key(|child| std::cmp::Reverse(child.total_size(SizeMode::Logical)));
         }
     }
 
-    entries.sort_by_key(|entry| std::cmp::Reverse(entry.total_size()));
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.total_size(SizeMode::Logical)));
     entries
 }
 
@@ -1285,22 +1505,25 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::{Cli, EnvOverrides};
-    use purifier_core::llm::{LlmClassification, OpenRouterClient};
+    use purifier_core::llm::{LlmClassification, OpenRouterClient, UnknownEntry};
     use purifier_core::provider::{LlmClient, ProviderKind, ResolvedProviderConfig};
     use purifier_core::rules::RulesEngine;
-    use purifier_core::types::{Category, FileEntry, SafetyLevel};
+    use purifier_core::size::SizeMode;
+    use purifier_core::types::{Category, FileEntry, SafetyLevel, ScanEvent};
 
     use super::{
-        apply_llm_results, apply_runtime_config, apply_runtime_connection_event,
+        apply_llm_results, apply_runtime_config, apply_runtime_connection_event, apply_scan_update,
         apply_startup_config, apply_startup_messages, build_tree, build_tree_snapshot,
         load_app_config, normalize_scan_path, queue_unknown_entry, refresh_scan_snapshot,
         requeue_unknown_entries_for_visible_tree, reset_pending_llm_labels,
-        reset_pending_llm_labels_in_state, resolve_initial_scan_path, start_llm_processing,
-        start_runtime_connection_check, RuntimeConfig,
+        reset_pending_llm_labels_in_state, resolve_initial_scan_path, resolve_initial_scan_profile,
+        restart_llm_processing_for_new_scan, start_llm_processing, start_runtime_connection_check,
+        start_scan_processing, RuntimeConfig, ScanProcessingUpdate, ScanProgressSnapshot,
     };
     use crate::app::{App, LlmStatus, ScanStatus};
     use crate::config::AppConfig;
     use purifier_core::classifier::Classifier;
+    use purifier_core::{Filter, FilterTest, ScanProfile};
 
     fn spawn_http_server(
         status_line: &'static str,
@@ -1355,6 +1578,69 @@ mod tests {
         assert_eq!(
             app.llm_status,
             LlmStatus::Connecting(ProviderKind::OpenRouter)
+        );
+    }
+
+    #[test]
+    fn restart_llm_processing_for_new_scan_should_replace_old_result_receiver() {
+        let classifier = Classifier::new(
+            RulesEngine::new(&[]).expect("rules engine should initialize"),
+            Some(LlmClient::OpenRouter(OpenRouterClient::new(
+                ResolvedProviderConfig::new(
+                    ProviderKind::OpenRouter,
+                    Some("test-key".to_string()),
+                    "google/gemini-2.0-flash-001".to_string(),
+                    "https://openrouter.ai/api/v1".to_string(),
+                ),
+            ))),
+        );
+        let mut app = App::new(Some(PathBuf::from("/scan")), true, AppConfig::default());
+        let (old_unknown_tx, _old_unknown_rx) = crossbeam_channel::unbounded();
+        let (old_result_tx, old_result_rx) = crossbeam_channel::unbounded();
+        old_result_tx
+            .send(vec![LlmClassification {
+                path: PathBuf::from("/stale"),
+                category: Category::Unknown,
+                safety: SafetyLevel::Unknown,
+                reason: "stale".to_string(),
+            }])
+            .expect("stale result should be queued");
+
+        let mut unknown_tx = Some(old_unknown_tx);
+        let mut llm_result_rx = Some(old_result_rx);
+        let mut buffered_unknown_batches = vec![vec![UnknownEntry {
+            path: PathBuf::from("/stale"),
+            size: 1,
+            is_dir: false,
+            age_days: None,
+        }]];
+        let mut buffered_llm_results = vec![LlmClassification {
+            path: PathBuf::from("/stale"),
+            category: Category::Unknown,
+            safety: SafetyLevel::Unknown,
+            reason: "stale".to_string(),
+        }];
+
+        restart_llm_processing_for_new_scan(
+            &classifier,
+            &mut app,
+            &mut unknown_tx,
+            &mut llm_result_rx,
+            &mut buffered_unknown_batches,
+            &mut buffered_llm_results,
+        );
+
+        assert!(buffered_unknown_batches.is_empty());
+        assert!(buffered_llm_results.is_empty());
+        assert!(unknown_tx.is_some(), "new worker sender should exist");
+        assert!(llm_result_rx.is_some(), "new worker receiver should exist");
+        assert!(
+            llm_result_rx
+                .as_ref()
+                .expect("new result receiver should exist")
+                .try_recv()
+                .is_err(),
+            "new result receiver should not expose stale queued results"
         );
     }
 
@@ -1463,48 +1749,31 @@ mod tests {
     }
 
     #[test]
-    fn reset_pending_llm_labels_in_state_should_restore_backing_tree_rows_when_no_worker_is_live() {
+    fn reset_pending_llm_labels_in_state_should_restore_visible_tree_rows_when_no_worker_is_live() {
         let mut app = App::new(Some(PathBuf::from("/scan")), true, AppConfig::default());
-        let mut path_children = HashMap::from([(
-            PathBuf::from("/scan"),
-            vec![{
-                let mut entry = FileEntry::new(PathBuf::from("/scan/unknown"), 10, false, None);
-                entry.safety_reason = "Analyzing with LLM...".to_string();
-                entry
-            }],
-        )]);
         app.entries = vec![{
             let mut entry = FileEntry::new(PathBuf::from("/scan/unknown"), 10, false, None);
             entry.safety_reason = "Analyzing with LLM...".to_string();
             entry
         }];
 
-        reset_pending_llm_labels_in_state(&mut app, &mut path_children);
+        reset_pending_llm_labels_in_state(&mut app);
 
         assert_eq!(
             app.entries[0].safety_reason,
-            "Could not classify — review manually"
-        );
-        assert_eq!(
-            path_children[&PathBuf::from("/scan")][0].safety_reason,
             "Could not classify — review manually"
         );
     }
 
     #[test]
     fn apply_llm_results_should_update_matching_path_only() {
-        let parent = PathBuf::from("/scan");
-        let mut path_children = HashMap::from([(
-            parent,
-            vec![
-                FileEntry::new(PathBuf::from("/scan/match"), 10, false, None),
-                FileEntry::new(PathBuf::from("/scan/other"), 20, false, None),
-            ],
-        )]);
         let mut app = App::new(Some(PathBuf::from("/scan")), true, AppConfig::default());
+        app.entries = vec![
+            FileEntry::new(PathBuf::from("/scan/match"), 10, false, None),
+            FileEntry::new(PathBuf::from("/scan/other"), 20, false, None),
+        ];
 
         apply_llm_results(
-            &mut path_children,
             &mut app,
             vec![LlmClassification {
                 path: PathBuf::from("/scan/match"),
@@ -1514,17 +1783,14 @@ mod tests {
             }],
         );
 
-        let entries = path_children
-            .get(&PathBuf::from("/scan"))
-            .expect("entries should remain under parent");
-        assert_eq!(entries[0].safety, SafetyLevel::Safe);
-        assert_eq!(entries[0].category, Category::Cache);
-        assert_eq!(entries[0].safety_reason, "Recreated automatically");
-        assert_eq!(entries[1].safety, SafetyLevel::Unknown);
+        assert_eq!(app.entries[0].safety, SafetyLevel::Safe);
+        assert_eq!(app.entries[0].category, Category::Cache);
+        assert_eq!(app.entries[0].safety_reason, "Recreated automatically");
+        assert_eq!(app.entries[1].safety, SafetyLevel::Unknown);
     }
 
     #[test]
-    fn refresh_scan_snapshot_should_make_entries_visible_before_scan_complete() {
+    fn refresh_scan_snapshot_should_keep_entries_hidden_before_scan_complete() {
         let path_children = HashMap::from([(
             PathBuf::from("/scan"),
             vec![FileEntry::new(
@@ -1539,42 +1805,185 @@ mod tests {
 
         refresh_scan_snapshot(&mut app, &path_children);
 
-        assert_eq!(app.flat_entries.len(), 1);
-        assert_eq!(app.flat_entries[0].path, PathBuf::from("/scan/cache"));
+        assert!(
+            app.flat_entries.is_empty(),
+            "live entries should stay hidden until scan completion"
+        );
     }
 
     #[test]
-    fn apply_llm_results_should_refresh_visible_rows_while_scanning() {
-        let mut path_children = HashMap::from([(
-            PathBuf::from("/scan"),
-            vec![FileEntry::new(
-                PathBuf::from("/scan/cache"),
-                10,
-                false,
-                None,
-            )],
-        )]);
+    fn apply_llm_results_should_not_refresh_hidden_rows_while_scanning() {
         let mut app = App::new(Some(PathBuf::from("/scan")), true, AppConfig::default());
         app.scan_status = ScanStatus::Scanning;
-        refresh_scan_snapshot(&mut app, &path_children);
 
-        apply_llm_results(
-            &mut path_children,
+        apply_scan_update(
             &mut app,
-            vec![LlmClassification {
-                path: PathBuf::from("/scan/cache"),
-                category: Category::Cache,
-                safety: SafetyLevel::Safe,
-                reason: "Recreated automatically".to_string(),
-            }],
+            ScanProcessingUpdate::Progress(ScanProgressSnapshot {
+                entries_scanned: 12,
+                logical_bytes_found: 4096,
+                physical_bytes_found: 8192,
+                current_path: "/scan/cache".to_string(),
+            }),
         );
 
-        assert_eq!(app.flat_entries[0].safety, SafetyLevel::Safe);
-        assert_eq!(app.flat_entries[0].safety_reason, "Recreated automatically");
+        assert_eq!(app.files_scanned, 12);
+        assert_eq!(app.bytes_found, 8192);
+        assert_eq!(app.current_scan_dir, "/scan/cache");
+
+        assert!(
+            app.flat_entries.is_empty(),
+            "progress snapshots should not rebuild hidden scan rows"
+        );
     }
 
     #[test]
-    fn refresh_scan_snapshot_should_preserve_expanded_paths() {
+    fn start_scan_processing_should_return_immediately_while_scan_worker_runs() {
+        let (scan_tx, scan_rx) = crossbeam_channel::unbounded();
+        let started_at = std::time::Instant::now();
+
+        let handle = start_scan_processing(
+            PathBuf::from("/scan"),
+            scan_rx,
+            RulesEngine::new(&[]).expect("rules engine should initialize"),
+            true,
+        );
+
+        assert!(started_at.elapsed() < std::time::Duration::from_millis(100));
+
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            let _ = scan_tx.send(ScanEvent::ScanComplete {
+                total_entries: 0,
+                total_logical_bytes: 0,
+                total_physical_bytes: 0,
+                skipped: 0,
+            });
+        });
+
+        let update = handle
+            .updates
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("processor should eventually finish");
+        assert!(matches!(update, ScanProcessingUpdate::Complete(_)));
+    }
+
+    #[test]
+    fn start_scan_processing_should_build_final_tree_on_completion() {
+        let (scan_tx, scan_rx) = crossbeam_channel::unbounded();
+        let handle = start_scan_processing(
+            PathBuf::from("/scan"),
+            scan_rx,
+            RulesEngine::new(&[]).expect("rules engine should initialize"),
+            true,
+        );
+
+        scan_tx
+            .send(ScanEvent::Entry {
+                path: PathBuf::from("/scan/dir"),
+                sizes: purifier_core::size::EntrySizes {
+                    logical_bytes: 0,
+                    physical_bytes: 0,
+                    accounted_physical_bytes: 0,
+                },
+                file_identity: None,
+                is_dir: true,
+                modified: None,
+            })
+            .expect("directory event should send");
+        scan_tx
+            .send(ScanEvent::Entry {
+                path: PathBuf::from("/scan/dir/file"),
+                sizes: purifier_core::size::EntrySizes {
+                    logical_bytes: 5,
+                    physical_bytes: 5,
+                    accounted_physical_bytes: 5,
+                },
+                file_identity: None,
+                is_dir: false,
+                modified: None,
+            })
+            .expect("file event should send");
+        scan_tx
+            .send(ScanEvent::ScanComplete {
+                total_entries: 2,
+                total_logical_bytes: 5,
+                total_physical_bytes: 5,
+                skipped: 0,
+            })
+            .expect("complete event should send");
+
+        let result = loop {
+            let update = handle
+                .updates
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("processor should emit completion update");
+            if let ScanProcessingUpdate::Complete(result) = update {
+                break result;
+            }
+        };
+
+        assert_eq!(result.total_entries, 2);
+        assert_eq!(result.total_logical_bytes, 5);
+        assert_eq!(result.total_physical_bytes, 5);
+        assert_eq!(result.skipped, 0);
+        assert_eq!(
+            collect_paths(&result.entries),
+            vec![PathBuf::from("/scan/dir"), PathBuf::from("/scan/dir/file")]
+        );
+    }
+
+    #[test]
+    fn start_scan_processing_should_emit_unknown_batches_before_complete() {
+        let (scan_tx, scan_rx) = crossbeam_channel::unbounded();
+        let handle = start_scan_processing(
+            PathBuf::from("/scan"),
+            scan_rx,
+            RulesEngine::new(&[]).expect("rules engine should initialize"),
+            true,
+        );
+
+        scan_tx
+            .send(ScanEvent::Entry {
+                path: PathBuf::from("/scan/unknown"),
+                sizes: purifier_core::size::EntrySizes {
+                    logical_bytes: 5,
+                    physical_bytes: 5,
+                    accounted_physical_bytes: 5,
+                },
+                file_identity: None,
+                is_dir: false,
+                modified: None,
+            })
+            .expect("unknown entry should send");
+        scan_tx
+            .send(ScanEvent::ScanComplete {
+                total_entries: 1,
+                total_logical_bytes: 5,
+                total_physical_bytes: 5,
+                skipped: 0,
+            })
+            .expect("complete event should send");
+
+        let first_update = handle
+            .updates
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("processor should emit unknown batch before completion");
+        let second_update = handle
+            .updates
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("processor should emit completion update");
+
+        let ScanProcessingUpdate::UnknownBatch(batch) = first_update else {
+            panic!("expected unknown batch before completion");
+        };
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].path, PathBuf::from("/scan/unknown"));
+
+        assert!(matches!(second_update, ScanProcessingUpdate::Complete(_)));
+    }
+
+    #[test]
+    fn build_tree_snapshot_should_preserve_expanded_paths() {
         let path_children = HashMap::from([
             (
                 PathBuf::from("/scan"),
@@ -1594,7 +2003,13 @@ mod tests {
         app.scan_status = ScanStatus::Scanning;
         app.expanded_paths.insert(PathBuf::from("/scan/dir"));
 
-        refresh_scan_snapshot(&mut app, &path_children);
+        app.entries = build_tree_snapshot(
+            &app.scan_path,
+            &path_children,
+            &app.expanded_paths,
+            &app.deleted_paths,
+        );
+        app.rebuild_flat_entries();
 
         assert_eq!(
             app.flat_entries.len(),
@@ -1608,7 +2023,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_scan_snapshot_should_hide_deleted_paths() {
+    fn build_tree_snapshot_should_hide_deleted_paths() {
         let path_children = HashMap::from([(
             PathBuf::from("/scan"),
             vec![FileEntry::new(
@@ -1622,7 +2037,13 @@ mod tests {
         app.scan_status = ScanStatus::Scanning;
         app.deleted_paths.insert(PathBuf::from("/scan/cache"));
 
-        refresh_scan_snapshot(&mut app, &path_children);
+        app.entries = build_tree_snapshot(
+            &app.scan_path,
+            &path_children,
+            &app.expanded_paths,
+            &app.deleted_paths,
+        );
+        app.rebuild_flat_entries();
 
         assert!(
             app.flat_entries.is_empty(),
@@ -1692,6 +2113,9 @@ mod tests {
             ui: crate::config::UiConfig {
                 default_view: crate::app::View::BySize,
                 last_scan_path: Some(last_scan_path.clone()),
+                size_mode: SizeMode::Physical,
+                scan_profiles: Vec::new(),
+                last_selected_scan_profile: None,
             },
             ..AppConfig::default()
         };
@@ -1708,6 +2132,9 @@ mod tests {
             ui: crate::config::UiConfig {
                 default_view: crate::app::View::BySize,
                 last_scan_path: Some(tempdir.path().join("missing-dir")),
+                size_mode: SizeMode::Physical,
+                scan_profiles: Vec::new(),
+                last_selected_scan_profile: None,
             },
             ..AppConfig::default()
         };
@@ -1715,6 +2142,57 @@ mod tests {
         let resolved = resolve_initial_scan_path(None, &config);
 
         assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn resolve_initial_scan_profile_should_ignore_saved_profile_for_explicit_cli_path() {
+        let config = AppConfig {
+            ui: crate::config::UiConfig {
+                default_view: crate::app::View::BySize,
+                last_scan_path: Some(PathBuf::from("/tmp/saved")),
+                size_mode: SizeMode::Physical,
+                scan_profiles: vec![ScanProfile {
+                    name: "exclude-node-modules".to_string(),
+                    exclude: Some(Filter::single(FilterTest::PathGlob(
+                        "**/node_modules/**".to_string(),
+                    ))),
+                    mask: None,
+                    display_filter: None,
+                }],
+                last_selected_scan_profile: Some("exclude-node-modules".to_string()),
+            },
+            ..AppConfig::default()
+        };
+
+        let resolved =
+            resolve_initial_scan_profile(Some(std::path::Path::new("/tmp/cli")), &config);
+
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn resolve_initial_scan_profile_should_use_saved_profile_for_persisted_scan_path() {
+        let config = AppConfig {
+            ui: crate::config::UiConfig {
+                default_view: crate::app::View::BySize,
+                last_scan_path: Some(PathBuf::from("/tmp/saved")),
+                size_mode: SizeMode::Physical,
+                scan_profiles: vec![ScanProfile {
+                    name: "exclude-node-modules".to_string(),
+                    exclude: Some(Filter::single(FilterTest::PathGlob(
+                        "**/node_modules/**".to_string(),
+                    ))),
+                    mask: None,
+                    display_filter: None,
+                }],
+                last_selected_scan_profile: Some("exclude-node-modules".to_string()),
+            },
+            ..AppConfig::default()
+        };
+
+        let resolved = resolve_initial_scan_profile(None, &config);
+
+        assert_eq!(resolved, Some(config.ui.scan_profiles[0].clone()));
     }
 
     #[test]
@@ -1735,6 +2213,9 @@ mod tests {
             ui: crate::config::UiConfig {
                 default_view: crate::app::View::BySafety,
                 last_scan_path: None,
+                size_mode: SizeMode::Physical,
+                scan_profiles: Vec::new(),
+                last_selected_scan_profile: None,
             },
             ..AppConfig::default()
         };
@@ -1833,6 +2314,60 @@ mod tests {
             LlmStatus::Connecting(ProviderKind::OpenRouter)
         );
         assert!(!app.llm_online);
+    }
+
+    #[test]
+    fn scan_processing_and_runtime_validation_should_stay_non_blocking_while_scan_input_remains_responsive(
+    ) {
+        let mut app = App::new(Some(PathBuf::from("/scan")), true, AppConfig::default());
+        app.scan_status = ScanStatus::Scanning;
+
+        let (scan_tx, scan_rx) = crossbeam_channel::unbounded();
+        let scan_started_at = std::time::Instant::now();
+        let active_scan = start_scan_processing(
+            PathBuf::from("/scan"),
+            scan_rx,
+            RulesEngine::new(&[]).unwrap(),
+            true,
+        );
+
+        let runtime_config = RuntimeConfig {
+            scan_path: Some(PathBuf::from("/scan")),
+            provider: Some(ResolvedProviderConfig::new(
+                ProviderKind::OpenRouter,
+                Some("test-key".to_string()),
+                "google/gemini-2.0-flash-001".to_string(),
+                spawn_http_server(
+                    "200 OK",
+                    r#"{"choices":[{"message":{"content":"[{\"path\":\"/tmp/purifier-validation\",\"category\":\"BuildArtifact\",\"safety\":\"Safe\",\"reason\":\"Validation probe\"}]"}}]}"#,
+                    Some(std::time::Duration::from_millis(250)),
+                ),
+            )),
+            show_onboarding: false,
+            llm_enabled: true,
+        };
+        let classifier = Classifier::new(RulesEngine::new(&[]).unwrap(), None);
+
+        apply_runtime_config(&mut app, &runtime_config);
+        let validation_started_at = std::time::Instant::now();
+        let validation_rx = start_runtime_connection_check(&app, &classifier, &runtime_config);
+
+        assert!(scan_started_at.elapsed() < std::time::Duration::from_millis(100));
+        assert!(validation_started_at.elapsed() < std::time::Duration::from_millis(100));
+        assert!(validation_rx.is_some());
+
+        crate::input::handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('q'),
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        );
+
+        assert!(app.should_quit);
+
+        let _ = active_scan.cancel.send(());
+        drop(scan_tx);
     }
 
     #[test]
@@ -2250,6 +2785,7 @@ mod persist_settings_tests {
     use purifier_core::classifier::Classifier;
     use purifier_core::provider::ProviderKind;
     use purifier_core::rules::RulesEngine;
+    use purifier_core::{Filter, FilterTest, ScanProfile, SizeMode};
 
     use super::persist_settings;
     use crate::app::{App, AppModal, LlmStatus, SettingsDraft};
@@ -2328,7 +2864,17 @@ mod persist_settings_tests {
             model: "google/gemini-2.0-flash-001".to_string(),
             base_url: "https://openrouter.ai/api/v1".to_string(),
             llm_enabled: true,
+            size_mode: SizeMode::Logical,
+            selected_scan_profile: Some("exclude-node-modules".to_string()),
         };
+        preferences.ui.scan_profiles = vec![ScanProfile {
+            name: "exclude-node-modules".to_string(),
+            exclude: Some(Filter::single(FilterTest::PathGlob(
+                "**/node_modules/**".to_string(),
+            ))),
+            mask: None,
+            display_filter: None,
+        }];
         let mut secrets = FakeSecretStore::default();
 
         persist_settings(&config_path, &mut preferences, draft, &mut secrets).unwrap();
@@ -2350,6 +2896,11 @@ mod persist_settings_tests {
         assert!(config_path.exists());
         let loaded = AppConfig::load_or_default(&config_path).unwrap();
         assert_eq!(loaded.llm.active_provider, ProviderKind::OpenRouter);
+        assert_eq!(loaded.ui.size_mode, SizeMode::Logical);
+        assert_eq!(
+            loaded.ui.last_selected_scan_profile.as_deref(),
+            Some("exclude-node-modules")
+        );
         assert!(loaded.onboarding.first_launch_prompt_dismissed);
     }
 
@@ -2366,6 +2917,8 @@ mod persist_settings_tests {
             model: "google/gemini-2.0-flash-001".to_string(),
             base_url: "https://openrouter.ai/api/v1".to_string(),
             llm_enabled: true,
+            size_mode: SizeMode::Physical,
+            selected_scan_profile: None,
         };
         let mut secrets = FakeSecretStore::default();
         secrets
@@ -2395,6 +2948,8 @@ mod persist_settings_tests {
             model: "google/gemini-2.0-flash-001".to_string(),
             base_url: "https://openrouter.ai/api/v1".to_string(),
             llm_enabled: true,
+            size_mode: SizeMode::Physical,
+            selected_scan_profile: None,
         };
         let mut secrets = FakeSecretStore::default();
         secrets
@@ -2426,6 +2981,8 @@ mod persist_settings_tests {
                 None,
             ),
             llm_enabled: true,
+            size_mode: SizeMode::Physical,
+            selected_scan_profile: None,
         };
         let mut app = App::new(
             Some(std::path::PathBuf::from("/")),
@@ -2473,6 +3030,8 @@ mod persist_settings_tests {
             model: "claude-3-5-haiku-latest".to_string(),
             base_url: "https://api.anthropic.com".to_string(),
             llm_enabled: true,
+            size_mode: SizeMode::Physical,
+            selected_scan_profile: None,
         };
         let mut app = App::new(
             Some(std::path::PathBuf::from("/")),
@@ -2535,6 +3094,8 @@ mod persist_settings_tests {
                 None,
             ),
             llm_enabled: true,
+            size_mode: SizeMode::Physical,
+            selected_scan_profile: None,
         };
         let mut app = App::new(
             Some(std::path::PathBuf::from("/")),
@@ -2602,6 +3163,8 @@ mod persist_settings_tests {
                 None,
             ),
             llm_enabled: true,
+            size_mode: SizeMode::Physical,
+            selected_scan_profile: None,
         };
         let mut app = App::new(
             Some(std::path::PathBuf::from("/")),
@@ -2674,6 +3237,8 @@ mod persist_settings_tests {
                 None,
             ),
             llm_enabled: true,
+            size_mode: SizeMode::Physical,
+            selected_scan_profile: None,
         };
         let mut app = App::new(
             Some(std::path::PathBuf::from("/")),
@@ -2736,6 +3301,8 @@ mod persist_settings_tests {
             model: "google/gemini-2.0-flash-001".to_string(),
             base_url: "https://openrouter.ai/api/v1".to_string(),
             llm_enabled: true,
+            size_mode: SizeMode::Physical,
+            selected_scan_profile: None,
         };
         let mut app = App::new(
             Some(std::path::PathBuf::from("/")),
@@ -2790,6 +3357,8 @@ mod persist_settings_tests {
             model: "google/gemini-2.0-flash-001".to_string(),
             base_url: "https://openrouter.ai/api/v1".to_string(),
             llm_enabled: true,
+            size_mode: SizeMode::Physical,
+            selected_scan_profile: None,
         };
         let mut app = App::new(
             Some(std::path::PathBuf::from("/")),
@@ -2845,6 +3414,8 @@ mod persist_settings_tests {
             model: "google/gemini-2.0-flash-001".to_string(),
             base_url: "https://openrouter.ai/api/v1".to_string(),
             llm_enabled: true,
+            size_mode: SizeMode::Physical,
+            selected_scan_profile: None,
         };
         let mut app = App::new(
             Some(std::path::PathBuf::from("/")),

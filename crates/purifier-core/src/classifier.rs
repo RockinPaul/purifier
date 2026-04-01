@@ -5,6 +5,7 @@ use crossbeam_channel::{Receiver, Sender};
 use crate::llm::{LlmClassification, UnknownEntry};
 use crate::provider::LlmClient;
 use crate::rules::RulesEngine;
+use crate::size::SizeMode;
 use crate::types::{FileEntry, SafetyLevel};
 
 const LLM_BATCH_SIZE: usize = 50;
@@ -21,6 +22,10 @@ impl Classifier {
 
     pub fn set_llm_client(&mut self, llm_client: Option<LlmClient>) {
         self.llm_client = llm_client;
+    }
+
+    pub fn rules(&self) -> &RulesEngine {
+        &self.rules
     }
 
     fn worker_llm_client(&self) -> Option<LlmClient> {
@@ -83,7 +88,7 @@ fn collect_unknowns_recursive(entries: &[FileEntry], out: &mut Vec<UnknownEntry>
 
             out.push(UnknownEntry {
                 path: entry.path.clone(),
-                size: entry.size,
+                size: entry.total_size(SizeMode::Logical),
                 is_dir: entry.is_dir,
                 age_days,
             });

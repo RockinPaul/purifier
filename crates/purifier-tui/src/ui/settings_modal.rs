@@ -24,6 +24,11 @@ pub fn draw(frame: &mut Frame, app: &App, title: &str) {
 fn modal_lines(app: &App, draft: &crate::app::SettingsDraft) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(format!("Provider: {:?}  [1-4] switch", draft.provider)),
+        Line::from(format!("Size mode: {:?}  [m] toggle", draft.size_mode)),
+        Line::from(format!(
+            "Scan profile: {}  [p] cycle",
+            draft.selected_scan_profile.as_deref().unwrap_or("none")
+        )),
         Line::from(format!(
             "Model (provider-derived, read-only): {}",
             draft.model
@@ -57,6 +62,12 @@ fn modal_lines(app: &App, draft: &crate::app::SettingsDraft) -> Vec<Line<'static
 
     lines.push(Line::from(""));
     lines.extend([
+        Line::from(vec![
+            Span::styled(" [m] ", Style::default().fg(Color::Cyan)),
+            Span::raw("Toggle size mode  "),
+            Span::styled(" [p] ", Style::default().fg(Color::Cyan)),
+            Span::raw("Cycle scan profile"),
+        ]),
         Line::from(vec![
             Span::styled(" [a] ", Style::default().fg(Color::Cyan)),
             Span::raw("Edit API key  "),
@@ -131,6 +142,8 @@ mod tests {
             model: "google/gemini-2.0-flash-001".to_string(),
             base_url: "https://openrouter.ai/api/v1".to_string(),
             llm_enabled: true,
+            size_mode: purifier_core::SizeMode::Physical,
+            selected_scan_profile: None,
         };
         let mut app = crate::app::App::new(None, true, crate::config::AppConfig::default());
         app.modal = Some(crate::app::AppModal::Settings(draft.clone()));
@@ -162,6 +175,8 @@ mod tests {
             model: "google/gemini-2.0-flash-001".to_string(),
             base_url: "https://openrouter.ai/api/v1".to_string(),
             llm_enabled: true,
+            size_mode: purifier_core::SizeMode::Physical,
+            selected_scan_profile: None,
         };
         let mut app = crate::app::App::new(None, true, crate::config::AppConfig::default());
         app.modal = Some(crate::app::AppModal::Settings(draft.clone()));
@@ -186,6 +201,8 @@ mod tests {
             model: "google/gemini-2.0-flash-001".to_string(),
             base_url: "https://openrouter.ai/api/v1".to_string(),
             llm_enabled: true,
+            size_mode: purifier_core::SizeMode::Physical,
+            selected_scan_profile: None,
         };
         let mut app = crate::app::App::new(None, true, crate::config::AppConfig::default());
         app.modal = Some(crate::app::AppModal::Settings(draft.clone()));
@@ -212,6 +229,8 @@ mod tests {
             model: "model".to_string(),
             base_url: "url".to_string(),
             llm_enabled: true,
+            size_mode: purifier_core::SizeMode::Physical,
+            selected_scan_profile: None,
         };
         let cleared = SettingsDraft {
             api_key_edited: true,

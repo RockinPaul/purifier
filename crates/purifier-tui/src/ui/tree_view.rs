@@ -8,6 +8,18 @@ use super::{format_size, truncate_start, truncate_tail};
 use crate::app::{App, ScanStatus};
 
 pub fn draw(frame: &mut Frame, app: &App, main_area: Rect, info_area: Rect) {
+    if app.scan_status == ScanStatus::Scanning {
+        let main = Paragraph::new("").block(Block::default().borders(Borders::ALL));
+        frame.render_widget(main, main_area);
+
+        let info = Paragraph::new("Scanning in progress...")
+            .block(Block::default().borders(Borders::ALL).title(" Info "));
+        frame.render_widget(info, info_area);
+
+        draw_scanning_overlay(frame, app, main_area);
+        return;
+    }
+
     let items: Vec<ListItem> = app
         .flat_entries
         .iter()
@@ -80,11 +92,18 @@ pub fn draw(frame: &mut Frame, app: &App, main_area: Rect, info_area: Rect) {
     frame.render_stateful_widget(list, main_area, &mut list_state);
 
     let info_text = if let Some(entry) = app.selected_entry() {
-        if entry.safety_reason.is_empty() {
-            format!("{}", entry.path.display())
-        } else {
-            format!("{} — {}", entry.path.display(), entry.safety_reason)
+        let mut lines = vec![
+            format!("Path: {}", entry.path.display()),
+            format!("Shown size: {}", format_size(entry.size)),
+            format!("Logical: {}", format_size(entry.logical_size)),
+            format!("Physical: {}", format_size(entry.physical_size)),
+        ];
+
+        if !entry.safety_reason.is_empty() {
+            lines.push(format!("Safety: {}", entry.safety_reason));
         }
+
+        lines.join("\n")
     } else if app.scan_status == ScanStatus::Scanning {
         "Scanning in progress...".to_string()
     } else {
@@ -94,10 +113,6 @@ pub fn draw(frame: &mut Frame, app: &App, main_area: Rect, info_area: Rect) {
     let info =
         Paragraph::new(info_text).block(Block::default().borders(Borders::ALL).title(" Info "));
     frame.render_widget(info, info_area);
-
-    if app.scan_status == ScanStatus::Scanning {
-        draw_scanning_overlay(frame, app, main_area);
-    }
 }
 
 pub(crate) fn scanning_overlay_area(main_area: Rect) -> Rect {
@@ -130,7 +145,7 @@ fn draw_scanning_overlay(frame: &mut Frame, app: &App, main_area: Rect) {
         )),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Files: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("  Entries: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 format!("{}", app.files_scanned),
                 Style::default().fg(Color::White),
@@ -332,8 +347,12 @@ mod tests {
             "scan progress box should remain visible during scanning: {text}"
         );
         assert!(
-            text.contains("live-file"),
-            "live tree entries should still render under the progress overlay: {text}"
+            !text.contains("live-file"),
+            "live tree entries should stay hidden until scanning completes: {text}"
+        );
+        assert!(
+            text.contains("Entries:"),
+            "scan popup should describe scanned entries truthfully: {text}"
         );
     }
 }
