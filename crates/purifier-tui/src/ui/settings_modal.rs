@@ -7,7 +7,7 @@ use ratatui::Frame;
 use crate::app::{App, AppModal};
 
 pub fn draw(frame: &mut Frame, app: &App, title: &str) {
-    let area = centered_rect(frame.area(), 72, 16);
+    let area = centered_rect(frame.area(), 72, 18);
     frame.render_widget(Clear, area);
 
     let draft = match app.modal.as_ref() {
@@ -15,14 +15,14 @@ pub fn draw(frame: &mut Frame, app: &App, title: &str) {
         _ => return,
     };
 
-    let lines = modal_lines(draft);
+    let lines = modal_lines(app, draft);
 
     let widget = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title));
     frame.render_widget(widget, area);
 }
 
-fn modal_lines(draft: &crate::app::SettingsDraft) -> Vec<Line<'static>> {
-    vec![
+fn modal_lines(app: &App, draft: &crate::app::SettingsDraft) -> Vec<Line<'static>> {
+    let mut lines = vec![
         Line::from(format!("Provider: {:?}  [1-4] switch", draft.provider)),
         Line::from(format!(
             "Model (provider-derived, read-only): {}",
@@ -36,7 +36,27 @@ fn modal_lines(draft: &crate::app::SettingsDraft) -> Vec<Line<'static>> {
         Line::from("Press [a] to set or replace the provider key."),
         Line::from("OpenRouter and OpenAI are live right now."),
         Line::from("Anthropic and Google are saved for later support."),
-        Line::from(""),
+    ];
+
+    if app.settings_modal_is_saving {
+        lines.push(Line::from(vec![Span::styled(
+            format!(
+                "Saving settings and validating {:?} connection...",
+                draft.provider
+            ),
+            Style::default().fg(Color::Cyan),
+        )]));
+    }
+
+    if let Some(error) = app.settings_modal_error.as_deref() {
+        lines.push(Line::from(vec![Span::styled(
+            error.to_string(),
+            Style::default().fg(Color::Red),
+        )]));
+    }
+
+    lines.push(Line::from(""));
+    lines.extend([
         Line::from(vec![
             Span::styled(" [a] ", Style::default().fg(Color::Cyan)),
             Span::raw("Edit API key  "),
@@ -55,7 +75,9 @@ fn modal_lines(draft: &crate::app::SettingsDraft) -> Vec<Line<'static>> {
             Span::styled(" [Esc] ", Style::default().fg(Color::Yellow)),
             Span::raw("Cancel/Skip"),
         ]),
-    ]
+    ]);
+
+    lines
 }
 
 fn api_key_status(draft: &crate::app::SettingsDraft) -> String {
@@ -110,8 +132,10 @@ mod tests {
             base_url: "https://openrouter.ai/api/v1".to_string(),
             llm_enabled: true,
         };
+        let mut app = crate::app::App::new(None, true, crate::config::AppConfig::default());
+        app.modal = Some(crate::app::AppModal::Settings(draft.clone()));
 
-        let lines = modal_lines(&draft);
+        let lines = modal_lines(&app, &draft);
         let rendered = lines
             .iter()
             .map(|line| line.to_string())
@@ -126,6 +150,56 @@ mod tests {
         assert!(rendered.contains("OpenRouter and OpenAI are live right now"));
         assert!(rendered.contains("Anthropic and Google are saved for later support"));
         assert!(rendered.contains("API Key: <not shown unless edited>"));
+    }
+
+    #[test]
+    fn modal_lines_should_show_pending_validation_status_inline() {
+        let draft = SettingsDraft {
+            provider: ProviderKind::OpenRouter,
+            api_key: "bad-key".to_string(),
+            api_key_edited: true,
+            api_key_editing: false,
+            model: "google/gemini-2.0-flash-001".to_string(),
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            llm_enabled: true,
+        };
+        let mut app = crate::app::App::new(None, true, crate::config::AppConfig::default());
+        app.modal = Some(crate::app::AppModal::Settings(draft.clone()));
+        app.settings_modal_is_saving = true;
+
+        let rendered = modal_lines(&app, &draft)
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("Saving settings and validating OpenRouter connection..."));
+    }
+
+    #[test]
+    fn modal_lines_should_show_inline_validation_error() {
+        let draft = SettingsDraft {
+            provider: ProviderKind::OpenRouter,
+            api_key: "bad-key".to_string(),
+            api_key_edited: true,
+            api_key_editing: false,
+            model: "google/gemini-2.0-flash-001".to_string(),
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            llm_enabled: true,
+        };
+        let mut app = crate::app::App::new(None, true, crate::config::AppConfig::default());
+        app.modal = Some(crate::app::AppModal::Settings(draft.clone()));
+        app.settings_modal_error = Some(
+            "OpenRouter connection failed: HTTP 401 Unauthorized - Invalid API key. Update the API key or provider and save again.".to_string(),
+        );
+
+        let rendered = modal_lines(&app, &draft)
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("OpenRouter connection failed: HTTP 401 Unauthorized - Invalid API key. Update the API key or provider and save again."));
     }
 
     #[test]

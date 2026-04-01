@@ -1,7 +1,9 @@
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseEvent, MouseEventKind};
 use purifier_core::provider::{default_provider_settings, ProviderKind};
+use ratatui::layout::Rect;
 
 use crate::app::{App, AppModal, AppScreen, ScanStatus, SettingsDraft, View};
+use crate::ui::{self, MainLayout};
 
 pub enum InputResult {
     None,
@@ -24,6 +26,39 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> InputResult {
             InputResult::None
         }
     }
+}
+
+pub fn handle_mouse(app: &mut App, mouse: MouseEvent, layout: MainLayout) {
+    if app.modal.is_some() || !matches!(app.screen, AppScreen::Main) {
+        return;
+    }
+
+    if !rect_contains(layout.main, mouse.column, mouse.row) {
+        return;
+    }
+
+    if app.scan_status == ScanStatus::Scanning
+        && rect_contains(
+            ui::tree_view::scanning_overlay_area(layout.main),
+            mouse.column,
+            mouse.row,
+        )
+    {
+        return;
+    }
+
+    match mouse.kind {
+        MouseEventKind::ScrollDown => app.move_down(),
+        MouseEventKind::ScrollUp => app.move_up(),
+        _ => {}
+    }
+}
+
+fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
+    column >= rect.x
+        && column < rect.x.saturating_add(rect.width)
+        && row >= rect.y
+        && row < rect.y.saturating_add(rect.height)
 }
 
 fn handle_dir_picker(app: &mut App, key: KeyEvent) -> InputResult {
@@ -148,6 +183,10 @@ fn handle_modal(app: &mut App, key: KeyEvent) -> InputResult {
 }
 
 fn handle_settings_modal(app: &mut App, key: KeyEvent) -> InputResult {
+    if app.settings_modal_is_saving {
+        return InputResult::None;
+    }
+
     if key.code == KeyCode::Enter {
         let is_onboarding = matches!(app.modal, Some(AppModal::Onboarding(_)));
         let Some(AppModal::Settings(draft) | AppModal::Onboarding(draft)) = app.modal.as_mut()
@@ -160,22 +199,25 @@ fn handle_settings_modal(app: &mut App, key: KeyEvent) -> InputResult {
         }
 
         if is_onboarding && draft.api_key.is_empty() {
+            app.settings_modal_error =
+                Some("Enter an API key or press Esc to skip onboarding".to_string());
             app.last_error = Some("Enter an API key or press Esc to skip onboarding".to_string());
             return InputResult::None;
         }
 
+        app.settings_modal_error = None;
         app.last_error = None;
         return InputResult::SaveSettings(draft.clone());
     }
 
     if matches!(app.modal, Some(AppModal::Onboarding(_))) && key.code == KeyCode::Esc {
-        app.modal = None;
+        app.close_modal();
         app.last_error = None;
         return InputResult::SkipOnboarding;
     }
 
     if key.code == KeyCode::Esc {
-        app.modal = None;
+        app.close_modal();
         return InputResult::None;
     }
 
@@ -210,11 +252,14 @@ fn handle_settings_modal(app: &mut App, key: KeyEvent) -> InputResult {
             KeyCode::Char(c) => {
                 draft.api_key.push(c);
                 draft.api_key_edited = true;
+                app.settings_modal_error = None;
                 app.last_error = None;
             }
             KeyCode::Backspace | KeyCode::Delete => {
                 draft.api_key.pop();
                 draft.api_key_edited = true;
+                app.settings_modal_error = None;
+                app.last_error = None;
             }
             _ => {}
         }
@@ -228,9 +273,12 @@ fn handle_settings_modal(app: &mut App, key: KeyEvent) -> InputResult {
                 return InputResult::None;
             };
             apply_provider_defaults(draft, provider, settings);
+            app.settings_modal_error = None;
+            app.last_error = None;
         }
         KeyCode::Char('a') => {
             draft.api_key_editing = true;
+            app.settings_modal_error = None;
             app.last_error = None;
         }
         _ => {}
@@ -288,11 +336,41 @@ fn handle_delete_confirm(app: &mut App, key: KeyEvent) {
 mod tests {
     use std::path::PathBuf;
 
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
     use purifier_core::types::FileEntry;
 
-    use super::handle_key;
+    use super::{handle_key, handle_mouse};
     use crate::app::App;
+    use crate::ui;
+
+    fn scroll_down_event() -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn scroll_up_event() -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn scroll_down_at(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
 
     #[test]
     fn confirm_delete_should_keep_entry_and_record_error_when_delete_fails() {
@@ -323,6 +401,199 @@ mod tests {
         assert!(
             app.modal.is_none(),
             "confirmation should close after handling"
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_should_move_main_selection() {
+        let mut app = App::new(
+            Some(PathBuf::from("/")),
+            false,
+            crate::config::AppConfig::default(),
+        );
+        app.entries = vec![
+            FileEntry::new(PathBuf::from("/a"), 3, false, None),
+            FileEntry::new(PathBuf::from("/b"), 2, false, None),
+            FileEntry::new(PathBuf::from("/c"), 1, false, None),
+        ];
+        app.rebuild_flat_entries();
+        let layout = ui::main_layout(ratatui::layout::Rect::new(0, 0, 80, 20));
+
+        handle_mouse(
+            &mut app,
+            scroll_down_at(layout.main.x + 1, layout.main.y + 1),
+            layout,
+        );
+        assert_eq!(
+            app.selected_index, 1,
+            "scroll down should advance selection"
+        );
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                column: layout.main.x + 1,
+                row: layout.main.y + 1,
+                ..scroll_up_event()
+            },
+            layout,
+        );
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: layout.main.x + 1,
+                row: layout.main.y + 1,
+                modifiers: KeyModifiers::NONE,
+            },
+            layout,
+        );
+
+        assert_eq!(
+            app.selected_index, 0,
+            "scroll down then up should restore selection"
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_should_not_move_selection_when_modal_or_non_main_interaction_is_active() {
+        let mut settings_app = App::new(
+            Some(PathBuf::from("/")),
+            false,
+            crate::config::AppConfig::default(),
+        );
+        settings_app.entries = vec![
+            FileEntry::new(PathBuf::from("/a"), 3, false, None),
+            FileEntry::new(PathBuf::from("/b"), 2, false, None),
+        ];
+        settings_app.rebuild_flat_entries();
+        settings_app.open_settings();
+        let layout = ui::main_layout(ratatui::layout::Rect::new(0, 0, 80, 20));
+
+        handle_mouse(
+            &mut settings_app,
+            scroll_down_at(layout.main.x + 1, layout.main.y + 1),
+            layout,
+        );
+
+        assert_eq!(
+            settings_app.selected_index, 0,
+            "settings modal should block wheel navigation"
+        );
+
+        let mut delete_confirm_app = App::new(
+            Some(PathBuf::from("/")),
+            false,
+            crate::config::AppConfig::default(),
+        );
+        delete_confirm_app.entries = vec![
+            FileEntry::new(PathBuf::from("/a"), 3, false, None),
+            FileEntry::new(PathBuf::from("/b"), 2, false, None),
+        ];
+        delete_confirm_app.rebuild_flat_entries();
+        delete_confirm_app.open_delete_confirm();
+
+        handle_mouse(
+            &mut delete_confirm_app,
+            scroll_down_at(layout.main.x + 1, layout.main.y + 1),
+            layout,
+        );
+
+        assert_eq!(
+            delete_confirm_app.selected_index, 0,
+            "delete confirm should block wheel navigation"
+        );
+
+        let mut dir_picker_app = App::new(None, false, crate::config::AppConfig::default());
+        dir_picker_app.selected_index = 1;
+        dir_picker_app.dir_picker_typing = true;
+
+        handle_mouse(&mut dir_picker_app, scroll_down_event(), layout);
+
+        assert_eq!(
+            dir_picker_app.selected_index, 1,
+            "wheel input should not mutate hidden main selection while typing in dir picker"
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_should_only_scroll_when_pointer_is_over_main_tree_pane() {
+        let mut app = App::new(
+            Some(PathBuf::from("/")),
+            false,
+            crate::config::AppConfig::default(),
+        );
+        app.entries = vec![
+            FileEntry::new(PathBuf::from("/a"), 3, false, None),
+            FileEntry::new(PathBuf::from("/b"), 2, false, None),
+            FileEntry::new(PathBuf::from("/c"), 1, false, None),
+        ];
+        app.rebuild_flat_entries();
+        let layout = ui::main_layout(ratatui::layout::Rect::new(0, 0, 80, 20));
+
+        handle_mouse(
+            &mut app,
+            scroll_down_at(layout.main.x + 1, layout.main.y + 1),
+            layout,
+        );
+        assert_eq!(
+            app.selected_index, 1,
+            "tree pane should accept wheel scroll"
+        );
+
+        handle_mouse(
+            &mut app,
+            scroll_down_at(layout.tabs.x + 1, layout.tabs.y + 1),
+            layout,
+        );
+        assert_eq!(app.selected_index, 1, "tab bar should ignore wheel scroll");
+
+        handle_mouse(
+            &mut app,
+            scroll_down_at(layout.info.x + 1, layout.info.y + 1),
+            layout,
+        );
+        assert_eq!(
+            app.selected_index, 1,
+            "info pane should ignore wheel scroll"
+        );
+
+        handle_mouse(
+            &mut app,
+            scroll_down_at(layout.status.x + 1, layout.status.y),
+            layout,
+        );
+        assert_eq!(
+            app.selected_index, 1,
+            "status bar should ignore wheel scroll"
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_should_ignore_pointer_inside_scanning_overlay() {
+        let mut app = App::new(
+            Some(PathBuf::from("/")),
+            false,
+            crate::config::AppConfig::default(),
+        );
+        app.entries = vec![
+            FileEntry::new(PathBuf::from("/a"), 3, false, None),
+            FileEntry::new(PathBuf::from("/b"), 2, false, None),
+            FileEntry::new(PathBuf::from("/c"), 1, false, None),
+        ];
+        app.rebuild_flat_entries();
+        app.scan_status = crate::app::ScanStatus::Scanning;
+        let layout = ui::main_layout(ratatui::layout::Rect::new(0, 0, 80, 20));
+        let overlay = ui::tree_view::scanning_overlay_area(layout.main);
+
+        handle_mouse(
+            &mut app,
+            scroll_down_at(overlay.x + 1, overlay.y + 1),
+            layout,
+        );
+
+        assert_eq!(
+            app.selected_index, 0,
+            "centered scan overlay should block wheel scroll"
         );
     }
 }
@@ -484,6 +755,125 @@ mod modal_submit_tests {
         assert_eq!(draft.provider, ProviderKind::OpenAI);
         assert_eq!(draft.model, default_settings.model);
         assert_eq!(draft.base_url, default_settings.base_url);
+    }
+
+    #[test]
+    fn saving_modal_should_ignore_keyboard_edits_and_navigation() {
+        let mut app = App::new(
+            Some(std::path::PathBuf::from("/")),
+            true,
+            AppConfig::default(),
+        );
+        app.modal = Some(AppModal::Settings(SettingsDraft {
+            provider: ProviderKind::OpenRouter,
+            api_key: "old-key".to_string(),
+            api_key_edited: true,
+            api_key_editing: false,
+            model: "google/gemini-2.0-flash-001".to_string(),
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            llm_enabled: true,
+        }));
+        app.settings_modal_is_saving = true;
+        app.settings_modal_error = Some("still validating".to_string());
+        app.last_error = Some("still validating".to_string());
+
+        assert!(matches!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)
+            ),
+            InputResult::None
+        ));
+        assert!(matches!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE)
+            ),
+            InputResult::None
+        ));
+        assert!(matches!(
+            handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            InputResult::None
+        ));
+
+        let Some(AppModal::Settings(draft)) = app.modal.as_ref() else {
+            panic!("settings modal should stay open while saving");
+        };
+        assert_eq!(draft.provider, ProviderKind::OpenRouter);
+        assert_eq!(draft.api_key, "old-key");
+        assert!(!draft.api_key_editing);
+        assert!(app.settings_modal_is_saving);
+        assert_eq!(
+            app.settings_modal_error.as_deref(),
+            Some("still validating")
+        );
+        assert_eq!(app.last_error.as_deref(), Some("still validating"));
+    }
+
+    #[test]
+    fn editing_api_key_should_clear_inline_and_global_errors_together() {
+        let mut app = App::new(
+            Some(std::path::PathBuf::from("/")),
+            true,
+            AppConfig::default(),
+        );
+        app.modal = Some(AppModal::Settings(SettingsDraft {
+            provider: ProviderKind::OpenRouter,
+            api_key: "bad".to_string(),
+            api_key_edited: true,
+            api_key_editing: true,
+            model: "google/gemini-2.0-flash-001".to_string(),
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            llm_enabled: true,
+        }));
+        app.settings_modal_error = Some("inline error".to_string());
+        app.last_error = Some("inline error".to_string());
+
+        let result = handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        );
+
+        assert!(matches!(result, InputResult::None));
+        let Some(AppModal::Settings(draft)) = app.modal.as_ref() else {
+            panic!("settings modal should stay open");
+        };
+        assert_eq!(draft.api_key, "badx");
+        assert!(app.settings_modal_error.is_none());
+        assert!(app.last_error.is_none());
+    }
+
+    #[test]
+    fn backspace_while_editing_api_key_should_clear_inline_and_global_errors_together() {
+        let mut app = App::new(
+            Some(std::path::PathBuf::from("/")),
+            true,
+            AppConfig::default(),
+        );
+        app.modal = Some(AppModal::Settings(SettingsDraft {
+            provider: ProviderKind::OpenRouter,
+            api_key: "bad".to_string(),
+            api_key_edited: true,
+            api_key_editing: true,
+            model: "google/gemini-2.0-flash-001".to_string(),
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            llm_enabled: true,
+        }));
+        app.settings_modal_error = Some("inline error".to_string());
+        app.last_error = Some("inline error".to_string());
+
+        let result = handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        );
+
+        assert!(matches!(result, InputResult::None));
+        let Some(AppModal::Settings(draft)) = app.modal.as_ref() else {
+            panic!("settings modal should stay open");
+        };
+        assert_eq!(draft.api_key, "ba");
+        assert!(app.settings_modal_error.is_none());
+        assert!(app.last_error.is_none());
     }
 
     #[test]

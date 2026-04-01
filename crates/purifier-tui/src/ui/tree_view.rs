@@ -1,19 +1,13 @@
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
 use super::{format_size, truncate_start, truncate_tail};
 use crate::app::{App, ScanStatus};
 
 pub fn draw(frame: &mut Frame, app: &App, main_area: Rect, info_area: Rect) {
-    // During scanning with no entries yet, show a progress screen
-    if app.scan_status == ScanStatus::Scanning && app.flat_entries.is_empty() {
-        draw_scanning(frame, app, main_area, info_area);
-        return;
-    }
-
     let items: Vec<ListItem> = app
         .flat_entries
         .iter()
@@ -82,7 +76,8 @@ pub fn draw(frame: &mut Frame, app: &App, main_area: Rect, info_area: Rect) {
         .collect();
 
     let list = List::new(items).block(Block::default().borders(Borders::ALL));
-    frame.render_widget(list, main_area);
+    let mut list_state = ListState::default().with_selected(Some(app.selected_index));
+    frame.render_stateful_widget(list, main_area, &mut list_state);
 
     let info_text = if let Some(entry) = app.selected_entry() {
         if entry.safety_reason.is_empty() {
@@ -90,6 +85,8 @@ pub fn draw(frame: &mut Frame, app: &App, main_area: Rect, info_area: Rect) {
         } else {
             format!("{} — {}", entry.path.display(), entry.safety_reason)
         }
+    } else if app.scan_status == ScanStatus::Scanning {
+        "Scanning in progress...".to_string()
     } else {
         "No selection".to_string()
     };
@@ -97,9 +94,13 @@ pub fn draw(frame: &mut Frame, app: &App, main_area: Rect, info_area: Rect) {
     let info =
         Paragraph::new(info_text).block(Block::default().borders(Borders::ALL).title(" Info "));
     frame.render_widget(info, info_area);
+
+    if app.scan_status == ScanStatus::Scanning {
+        draw_scanning_overlay(frame, app, main_area);
+    }
 }
 
-fn draw_scanning(frame: &mut Frame, app: &App, main_area: Rect, info_area: Rect) {
+pub(crate) fn scanning_overlay_area(main_area: Rect) -> Rect {
     let vertical = Layout::vertical([Constraint::Length(8)]).flex(Flex::Center);
     let horizontal = Layout::horizontal([Constraint::Length(
         50.min(main_area.width.saturating_sub(4)),
@@ -107,6 +108,11 @@ fn draw_scanning(frame: &mut Frame, app: &App, main_area: Rect, info_area: Rect)
     .flex(Flex::Center);
     let [center_v] = vertical.areas(main_area);
     let [center] = horizontal.areas(center_v);
+    center
+}
+
+fn draw_scanning_overlay(frame: &mut Frame, app: &App, main_area: Rect) {
+    let center = scanning_overlay_area(main_area);
 
     let dir_display = if app.current_scan_dir.is_empty() {
         "starting...".to_string()
@@ -153,10 +159,181 @@ fn draw_scanning(frame: &mut Frame, app: &App, main_area: Rect, info_area: Rect)
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Yellow)),
     );
+    frame.render_widget(Clear, center);
     frame.render_widget(scanning_widget, center);
+}
 
-    // Still render info area (empty during scan)
-    let info = Paragraph::new("Scanning in progress...")
-        .block(Block::default().borders(Borders::ALL).title(" Info "));
-    frame.render_widget(info, info_area);
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use purifier_core::types::FileEntry;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::Terminal;
+
+    use super::*;
+    use crate::config::AppConfig;
+    use crate::input::handle_key;
+
+    fn render_tree(app: &App, area: Rect) -> Buffer {
+        let backend = TestBackend::new(area.width, area.height + 3);
+        let mut terminal = Terminal::new(backend).expect("terminal should be created");
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    app,
+                    Rect::new(0, 0, area.width, area.height),
+                    Rect::new(0, area.height, area.width, 3),
+                );
+            })
+            .expect("tree should render");
+        terminal.backend().buffer().clone()
+    }
+
+    fn buffer_text(buffer: &Buffer) -> String {
+        let mut text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    fn buffer_region_text(buffer: &Buffer, area: Rect) -> String {
+        let mut text = String::new();
+        for y in area.y..area.y + area.height {
+            for x in area.x..area.x + area.width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    #[test]
+    fn draw_should_keep_keyboard_selected_row_visible_when_selection_moves_below_viewport() {
+        let mut app = App::new(Some(PathBuf::from("/")), false, AppConfig::default());
+        app.entries = (0..12)
+            .map(|index| {
+                FileEntry::new(
+                    PathBuf::from(format!("/file-{index}")),
+                    12 - index,
+                    false,
+                    None,
+                )
+            })
+            .collect();
+        app.rebuild_flat_entries();
+
+        for _ in 0..11 {
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            );
+        }
+
+        let buffer = render_tree(&app, Rect::new(0, 0, 80, 6));
+        let text = buffer_region_text(&buffer, Rect::new(0, 0, 80, 6));
+
+        assert!(
+            text.contains("file-11"),
+            "selected entry should be rendered when it falls below the viewport: {text}"
+        );
+    }
+
+    #[test]
+    fn draw_should_keep_arrow_key_selected_row_visible_when_selection_moves_below_viewport() {
+        let mut app = App::new(Some(PathBuf::from("/")), false, AppConfig::default());
+        app.entries = (0..12)
+            .map(|index| {
+                FileEntry::new(
+                    PathBuf::from(format!("/file-{index}")),
+                    12 - index,
+                    false,
+                    None,
+                )
+            })
+            .collect();
+        app.rebuild_flat_entries();
+
+        for _ in 0..11 {
+            handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+
+        let buffer = render_tree(&app, Rect::new(0, 0, 80, 6));
+        let text = buffer_region_text(&buffer, Rect::new(0, 0, 80, 6));
+
+        assert!(
+            text.contains("file-11"),
+            "down-arrow navigation should keep the selected row visible: {text}"
+        );
+    }
+
+    #[test]
+    fn draw_should_keep_arrow_key_selected_row_visible_when_moving_back_up() {
+        let mut app = App::new(Some(PathBuf::from("/")), false, AppConfig::default());
+        app.entries = (0..12)
+            .map(|index| {
+                FileEntry::new(
+                    PathBuf::from(format!("/file-{index}")),
+                    12 - index,
+                    false,
+                    None,
+                )
+            })
+            .collect();
+        app.rebuild_flat_entries();
+
+        for _ in 0..11 {
+            handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        for _ in 0..9 {
+            handle_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        }
+
+        let buffer = render_tree(&app, Rect::new(0, 0, 80, 6));
+        let text = buffer_region_text(&buffer, Rect::new(0, 0, 80, 6));
+
+        assert!(
+            text.contains("file-2"),
+            "up-arrow navigation should keep the selected row visible after scrolling back up: {text}"
+        );
+        assert!(
+            !text.contains("file-11"),
+            "viewport should follow the selection upward rather than staying pinned to the old window: {text}"
+        );
+    }
+
+    #[test]
+    fn draw_should_keep_scan_progress_visible_while_live_entries_are_present() {
+        let mut app = App::new(Some(PathBuf::from("/scan")), false, AppConfig::default());
+        app.scan_status = ScanStatus::Scanning;
+        app.entries = vec![FileEntry::new(
+            PathBuf::from("/scan/live-file"),
+            42,
+            false,
+            None,
+        )];
+        app.rebuild_flat_entries();
+        app.files_scanned = 7;
+        app.bytes_found = 42;
+        app.current_scan_dir = "/scan".to_string();
+
+        let buffer = render_tree(&app, Rect::new(0, 0, 80, 8));
+        let text = buffer_text(&buffer);
+
+        assert!(
+            text.contains("Scanning filesystem"),
+            "scan progress box should remain visible during scanning: {text}"
+        );
+        assert!(
+            text.contains("live-file"),
+            "live tree entries should still render under the progress overlay: {text}"
+        );
+    }
 }

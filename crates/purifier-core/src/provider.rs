@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -63,16 +64,37 @@ impl ProviderKind {
 pub enum LlmError {
     #[error("provider {provider:?} is missing an API key")]
     MissingApiKey { provider: ProviderKind },
-    #[error("request to {provider:?} failed: {message}")]
+    #[error("request to {provider:?} failed: {kind}")]
     Request {
         provider: ProviderKind,
-        message: String,
+        kind: LlmRequestErrorKind,
     },
     #[error("response from {provider:?} was invalid: {message}")]
     Response {
         provider: ProviderKind,
         message: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LlmRequestErrorKind {
+    Timeout,
+    Http { status: u16, body: Option<String> },
+    Network { message: String },
+}
+
+impl fmt::Display for LlmRequestErrorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Timeout => write!(f, "request timed out"),
+            Self::Http {
+                status,
+                body: Some(body),
+            } => write!(f, "HTTP {status} - {body}"),
+            Self::Http { status, body: None } => write!(f, "HTTP {status}"),
+            Self::Network { message } => write!(f, "{message}"),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -93,6 +115,13 @@ impl LlmClient {
         match self {
             Self::OpenRouter(client) => client.classify_batch(entries).await,
             Self::OpenAI(client) => client.classify_batch(entries).await,
+        }
+    }
+
+    pub async fn validate_connection(&self) -> Result<(), LlmError> {
+        match self {
+            Self::OpenRouter(client) => client.validate_connection().await,
+            Self::OpenAI(client) => client.validate_connection().await,
         }
     }
 }

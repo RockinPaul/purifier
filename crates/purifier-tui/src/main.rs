@@ -11,6 +11,7 @@ use std::time::{Duration, SystemTime};
 
 use clap::Parser;
 use crossterm::event::{self, Event};
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -20,7 +21,9 @@ use ratatui::Terminal;
 
 use purifier_core::classifier::{batch_unknowns, collect_unknowns, Classifier};
 use purifier_core::llm::{LlmClassification, OpenAiClient, OpenRouterClient, UnknownEntry};
-use purifier_core::provider::{LlmClient, ProviderKind, ResolvedProviderConfig};
+use purifier_core::provider::{
+    LlmClient, LlmError, LlmRequestErrorKind, ProviderKind, ResolvedProviderConfig,
+};
 use purifier_core::rules::RulesEngine;
 use purifier_core::scanner;
 use purifier_core::types::{FileEntry, SafetyLevel, ScanEvent};
@@ -36,6 +39,29 @@ const LLM_BATCH_SIZE: usize = 50;
 
 type UnknownBatchSender = crossbeam_channel::Sender<Vec<UnknownEntry>>;
 type LlmResultReceiver = crossbeam_channel::Receiver<Vec<LlmClassification>>;
+type RuntimeConnectionReceiver = crossbeam_channel::Receiver<RuntimeConnectionEvent>;
+
+enum RuntimeConnectionEvent {
+    Validated {
+        generation: u64,
+        provider: ProviderKind,
+        client: LlmClient,
+    },
+    Failed {
+        generation: u64,
+        provider: ProviderKind,
+        detail: RuntimeConnectionFailure,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RuntimeConnectionFailure {
+    MissingApiKey,
+    Timeout,
+    Http { status: u16, body: Option<String> },
+    Network(String),
+    InvalidResponse(String),
+}
 
 #[derive(Parser)]
 #[command(name = "purifier", about = "Disk cleanup with safety intelligence")]
@@ -121,9 +147,7 @@ fn main() -> io::Result<()> {
         RulesEngine::new(&[]).unwrap()
     });
 
-    let llm_client = runtime_config.provider.as_ref().map(build_llm_client);
-
-    let mut classifier = Classifier::new(rules, llm_client);
+    let mut classifier = Classifier::new(rules, None);
     let initial_scan_path = runtime_config
         .scan_path
         .as_deref()
@@ -133,7 +157,7 @@ fn main() -> io::Result<()> {
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -144,6 +168,8 @@ fn main() -> io::Result<()> {
         saved_config,
     );
     apply_runtime_config(&mut app, &runtime_config);
+    let mut runtime_connection_rx =
+        start_runtime_connection_check(&app, &classifier, &runtime_config);
     apply_startup_messages(&mut app, startup_warning, &cli, &env, &runtime_config);
     if runtime_config.show_onboarding {
         app.open_onboarding();
@@ -162,6 +188,7 @@ fn main() -> io::Result<()> {
         &mut app,
         &mut classifier,
         &mut scan_rx,
+        &mut runtime_connection_rx,
         &config_path,
         &mut secret_store,
         SessionContext {
@@ -172,17 +199,26 @@ fn main() -> io::Result<()> {
 
     // Restore terminal
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
 
     result
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Main loop coordinates terminal, scan, runtime validation, and session state"
+)]
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
     classifier: &mut Classifier,
     scan_rx: &mut Option<crossbeam_channel::Receiver<ScanEvent>>,
+    runtime_connection_rx: &mut Option<RuntimeConnectionReceiver>,
     config_path: &Path,
     secrets: &mut impl SecretStore,
     session: SessionContext<'_>,
@@ -214,6 +250,7 @@ fn run_loop(
                                     &mut entry,
                                     &mut pending_unknowns,
                                     unknown_tx.as_ref(),
+                                    matches!(app.llm_status, LlmStatus::Connecting(_)),
                                 );
 
                                 if let Some(parent) = path.parent() {
@@ -271,79 +308,135 @@ fn run_loop(
             }
         }
 
+        let connection_event = runtime_connection_rx
+            .as_ref()
+            .and_then(|connection_rx| connection_rx.try_recv().ok());
+        if let Some(event) = connection_event {
+            apply_runtime_connection_event(app, classifier, event);
+            *runtime_connection_rx = None;
+            pending_unknowns.clear();
+            (unknown_tx, llm_result_rx) = start_llm_processing(classifier, app);
+            if unknown_tx.is_some() {
+                requeue_unknown_entries_for_visible_tree(app, unknown_tx.as_ref());
+            } else {
+                reset_pending_llm_labels_in_state(app, &mut path_children);
+            }
+        }
+
         // Handle input — always polled every frame
         if event::poll(Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
-                match input::handle_key(app, key) {
-                    InputResult::StartScan(path) => {
-                        // User selected a directory from picker — start scanning
-                        let path = normalize_scan_path(&path);
-                        path_children.clear();
-                        pending_unknowns.clear();
-                        app.scan_path = path.clone();
-                        *scan_rx = Some(scanner::scan(&path));
-                    }
-                    InputResult::SaveSettings(draft) => {
-                        if apply_settings_save(
-                            app,
-                            config_path,
-                            draft,
-                            secrets,
-                            classifier,
-                            session.cli,
-                            session.env,
-                        )
-                        .is_ok()
-                        {
+            match event::read()? {
+                Event::Key(key) => {
+                    match input::handle_key(app, key) {
+                        InputResult::StartScan(path) => {
+                            // User selected a directory from picker — start scanning
+                            let path = normalize_scan_path(&path);
+                            path_children.clear();
                             pending_unknowns.clear();
-                            (unknown_tx, llm_result_rx) = start_llm_processing(classifier, app);
-                            if unknown_tx.is_some() {
-                                requeue_unknown_entries_for_visible_tree(app, unknown_tx.as_ref());
-                            } else {
-                                reset_pending_llm_labels_in_state(app, &mut path_children);
+                            app.scan_path = path.clone();
+                            *scan_rx = Some(scanner::scan(&path));
+                        }
+                        InputResult::SaveSettings(draft) => {
+                            if apply_settings_save(
+                                app,
+                                config_path,
+                                draft,
+                                secrets,
+                                classifier,
+                                runtime_connection_rx,
+                                session.cli,
+                                session.env,
+                            )
+                            .is_ok()
+                            {
+                                pending_unknowns.clear();
+                                (unknown_tx, llm_result_rx) = start_llm_processing(classifier, app);
+                                if unknown_tx.is_some() {
+                                    requeue_unknown_entries_for_visible_tree(
+                                        app,
+                                        unknown_tx.as_ref(),
+                                    );
+                                } else {
+                                    reset_pending_llm_labels_in_state(app, &mut path_children);
+                                }
                             }
                         }
+                        InputResult::SkipOnboarding => {
+                            let _ = apply_onboarding_skip(
+                                app,
+                                config_path,
+                                secrets,
+                                classifier,
+                                runtime_connection_rx,
+                                session.cli,
+                                session.env,
+                            );
+                        }
+                        InputResult::None => {}
                     }
-                    InputResult::SkipOnboarding => {
-                        let _ = apply_onboarding_skip(
-                            app,
-                            config_path,
-                            secrets,
-                            classifier,
-                            session.cli,
-                            session.env,
-                        );
+                    if app.should_quit {
+                        return Ok(());
                     }
-                    InputResult::None => {}
                 }
-                if app.should_quit {
-                    return Ok(());
+                Event::Mouse(mouse) => {
+                    let size = terminal.size()?;
+                    let layout =
+                        ui::main_layout(ratatui::layout::Rect::new(0, 0, size.width, size.height));
+                    input::handle_mouse(app, mouse, layout);
                 }
+                _ => {}
             }
         }
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Settings save needs runtime refresh context and mutable app state"
+)]
 fn apply_settings_save(
     app: &mut App,
     config_path: &Path,
     draft: SettingsDraft,
     secrets: &mut impl SecretStore,
     classifier: &mut Classifier,
+    runtime_connection_rx: &mut Option<RuntimeConnectionReceiver>,
     cli: &Cli,
     env: &EnvOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match persist_settings(config_path, &mut app.preferences, draft.clone(), secrets) {
         Ok(()) => {
-            refresh_runtime_state(app, classifier, secrets, cli, env);
-            app.close_modal();
+            let runtime_override_active =
+                refresh_runtime_state(app, classifier, runtime_connection_rx, secrets, cli, env);
+
+            if draft_needs_live_validation(&draft)
+                && !runtime_override_active
+                && runtime_connection_rx.is_some()
+            {
+                app.settings_modal_is_saving = true;
+                app.settings_modal_error = None;
+                app.pending_settings_validation_generation = Some(app.llm_connection_generation);
+            } else {
+                app.close_modal();
+            }
+
             Ok(())
         }
         Err(error) => {
-            app.last_error = Some(format!("Could not save settings: {error}"));
+            let message = format!("Could not save settings: {error}");
+            app.settings_modal_error = Some(message.clone());
+            app.last_error = Some(message);
             Err(error)
         }
     }
+}
+
+fn draft_needs_live_validation(draft: &SettingsDraft) -> bool {
+    draft.llm_enabled
+        && matches!(
+            draft.provider,
+            ProviderKind::OpenRouter | ProviderKind::OpenAI
+        )
 }
 
 fn apply_onboarding_skip(
@@ -351,30 +444,38 @@ fn apply_onboarding_skip(
     config_path: &Path,
     secrets: &mut impl SecretStore,
     classifier: &mut Classifier,
+    runtime_connection_rx: &mut Option<RuntimeConnectionReceiver>,
     cli: &Cli,
     env: &EnvOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
     app.preferences.onboarding.first_launch_prompt_dismissed = true;
     app.preferences.save(config_path)?;
-    refresh_runtime_state(app, classifier, secrets, cli, env);
+    refresh_runtime_state(app, classifier, runtime_connection_rx, secrets, cli, env);
     Ok(())
 }
 
 fn refresh_runtime_state(
     app: &mut App,
     classifier: &mut Classifier,
+    runtime_connection_rx: &mut Option<RuntimeConnectionReceiver>,
     secrets: &mut impl SecretStore,
     cli: &Cli,
     env: &EnvOverrides,
-) {
+) -> bool {
     let (runtime_config, warning) = load_runtime_config(cli, app.preferences.clone(), env, secrets);
-    classifier.set_llm_client(runtime_config.provider.as_ref().map(build_llm_client));
+    let runtime_override_active = runtime_overrides_active(cli, env, &runtime_config);
     apply_runtime_config(app, &runtime_config);
+    classifier.set_llm_client(None);
+    app.settings_modal_is_saving = false;
+    app.settings_modal_error = None;
+    app.pending_settings_validation_generation = None;
     app.last_error = None;
+    *runtime_connection_rx = start_runtime_connection_check(app, classifier, &runtime_config);
     app.last_warning = combine_warnings(
         warning.map(normalize_warning),
         runtime_override_warning(cli, env, &runtime_config),
     );
+    runtime_override_active
 }
 
 fn normalize_warning(warning: String) -> String {
@@ -389,19 +490,22 @@ fn runtime_override_warning(
     env: &EnvOverrides,
     runtime_config: &RuntimeConfig,
 ) -> Option<String> {
-    if cli.no_llm || cli.provider.is_some() || cli.api_key.is_some() {
-        return Some(
-            "Launch-time CLI/env overrides still control the live runtime; restart without overrides to use saved settings"
-                .to_string(),
-        );
-    }
-
-    let provider = runtime_config.provider.as_ref()?;
-
-    (env.api_key_for(provider.kind).is_some() || env.base_url_for(provider.kind).is_some()).then(|| {
+    runtime_overrides_active(cli, env, runtime_config).then(|| {
         "Launch-time CLI/env overrides still control the live runtime; restart without overrides to use saved settings"
             .to_string()
     })
+}
+
+fn runtime_overrides_active(cli: &Cli, env: &EnvOverrides, runtime_config: &RuntimeConfig) -> bool {
+    if cli.no_llm || cli.provider.is_some() || cli.api_key.is_some() {
+        return true;
+    }
+
+    let Some(provider) = runtime_config.provider.as_ref() else {
+        return false;
+    };
+
+    env.api_key_for(provider.kind).is_some() || env.base_url_for(provider.kind).is_some()
 }
 
 fn combine_warnings(primary: Option<String>, secondary: Option<String>) -> Option<String> {
@@ -693,15 +797,207 @@ fn apply_startup_messages(
 
 fn apply_runtime_config(app: &mut App, runtime_config: &RuntimeConfig) {
     app.llm_enabled = runtime_config.llm_enabled;
+    app.llm_online = false;
+    app.llm_connection_generation = app.llm_connection_generation.wrapping_add(1);
     app.llm_status = if runtime_config.show_onboarding {
         LlmStatus::NeedsSetup
     } else if !runtime_config.llm_enabled {
         LlmStatus::Disabled
     } else if let Some(provider) = runtime_config.provider.as_ref() {
-        LlmStatus::Ready(provider.kind)
+        LlmStatus::Connecting(provider.kind)
     } else {
         LlmStatus::Disabled
     };
+}
+
+fn start_runtime_connection_check(
+    app: &App,
+    classifier: &Classifier,
+    runtime_config: &RuntimeConfig,
+) -> Option<RuntimeConnectionReceiver> {
+    let provider = runtime_config.provider.as_ref()?;
+
+    if !runtime_config.llm_enabled
+        || !matches!(
+            provider.kind,
+            ProviderKind::OpenRouter | ProviderKind::OpenAI
+        )
+    {
+        return None;
+    }
+
+    let _ = classifier;
+    let _ = app;
+    let generation = app.llm_connection_generation;
+    let provider = provider.clone();
+    let client = build_llm_client(&provider);
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to create tokio runtime for LLM connection validation");
+
+        let event = match runtime.block_on(client.clone().validate_connection()) {
+            Ok(()) => RuntimeConnectionEvent::Validated {
+                generation,
+                provider: provider.kind,
+                client,
+            },
+            Err(error) => RuntimeConnectionEvent::Failed {
+                generation,
+                provider: provider.kind,
+                detail: connection_failure(&error),
+            },
+        };
+        let _ = tx.send(event);
+    });
+    Some(rx)
+}
+
+fn apply_runtime_connection_event(
+    app: &mut App,
+    classifier: &mut Classifier,
+    event: RuntimeConnectionEvent,
+) {
+    match event {
+        RuntimeConnectionEvent::Validated {
+            generation,
+            provider,
+            client,
+        } => {
+            if !matches_runtime_connection_target(app, generation, provider) {
+                return;
+            }
+            let closes_modal = app.pending_settings_validation_generation == Some(generation);
+            classifier.set_llm_client(Some(client));
+            app.llm_online = true;
+            app.llm_status = LlmStatus::Ready(provider);
+            app.last_error = None;
+
+            if closes_modal {
+                app.close_modal();
+            }
+        }
+        RuntimeConnectionEvent::Failed {
+            generation,
+            provider,
+            detail,
+        } => {
+            if !matches_runtime_connection_target(app, generation, provider) {
+                return;
+            }
+            let keeps_modal_open = app.pending_settings_validation_generation == Some(generation);
+            classifier.set_llm_client(None);
+            app.llm_online = false;
+            app.llm_status = LlmStatus::Error(connection_failure_status(provider, &detail));
+            let message = if keeps_modal_open {
+                format!(
+                    "{:?} connection failed: {}. Update the API key or provider and save again.",
+                    provider,
+                    connection_failure_detail(&detail)
+                )
+            } else {
+                format!(
+                    "{:?} connection failed: {}. Check the API key, model, base URL, or network, then update settings after scan completion.",
+                    provider,
+                    connection_failure_detail(&detail)
+                )
+            };
+            app.last_error = Some(message.clone());
+
+            if keeps_modal_open {
+                app.settings_modal_is_saving = false;
+                app.settings_modal_error = Some(message);
+                app.pending_settings_validation_generation = None;
+            }
+        }
+    }
+}
+
+fn matches_runtime_connection_target(app: &App, generation: u64, provider: ProviderKind) -> bool {
+    app.llm_enabled
+        && app.llm_connection_generation == generation
+        && app.llm_status == LlmStatus::Connecting(provider)
+}
+
+fn connection_failure(error: &LlmError) -> RuntimeConnectionFailure {
+    match error {
+        LlmError::MissingApiKey { .. } => RuntimeConnectionFailure::MissingApiKey,
+        LlmError::Request { kind, .. } => match kind {
+            LlmRequestErrorKind::Timeout => RuntimeConnectionFailure::Timeout,
+            LlmRequestErrorKind::Http { status, body } => RuntimeConnectionFailure::Http {
+                status: *status,
+                body: body.clone(),
+            },
+            LlmRequestErrorKind::Network { message } => {
+                RuntimeConnectionFailure::Network(message.clone())
+            }
+        },
+        LlmError::Response { message, .. } => {
+            RuntimeConnectionFailure::InvalidResponse(message.clone())
+        }
+    }
+}
+
+fn connection_failure_detail(detail: &RuntimeConnectionFailure) -> String {
+    match detail {
+        RuntimeConnectionFailure::MissingApiKey => "API key missing".to_string(),
+        RuntimeConnectionFailure::Timeout => "request timed out".to_string(),
+        RuntimeConnectionFailure::Http {
+            status,
+            body: Some(body),
+        } => format!("HTTP {} {} - {body}", status, http_status_reason(*status)),
+        RuntimeConnectionFailure::Http { status, body: None } => {
+            format!("HTTP {} {}", status, http_status_reason(*status))
+        }
+        RuntimeConnectionFailure::Network(message)
+        | RuntimeConnectionFailure::InvalidResponse(message) => message.clone(),
+    }
+}
+
+fn connection_failure_status(provider: ProviderKind, detail: &RuntimeConnectionFailure) -> String {
+    let provider_name = format!("{:?}", provider);
+    match detail {
+        RuntimeConnectionFailure::MissingApiKey => format!("{provider_name} setup incomplete"),
+        RuntimeConnectionFailure::Timeout => format!("{provider_name} timed out"),
+        RuntimeConnectionFailure::Http {
+            status: 401 | 403, ..
+        } => {
+            format!("{provider_name} auth failed")
+        }
+        RuntimeConnectionFailure::Http { status, .. } if *status == 404 => {
+            format!("{provider_name} bad base URL")
+        }
+        RuntimeConnectionFailure::Http { status, body } if *status == 400 => {
+            if body
+                .as_deref()
+                .is_some_and(|body| body.to_ascii_lowercase().contains("model"))
+            {
+                format!("{provider_name} model failed")
+            } else {
+                format!("{provider_name} request failed")
+            }
+        }
+        RuntimeConnectionFailure::Http { .. } => format!("{provider_name} request failed"),
+        RuntimeConnectionFailure::Network(_) => format!("{provider_name} network failed"),
+        RuntimeConnectionFailure::InvalidResponse(_) => format!("{provider_name} response failed"),
+    }
+}
+
+fn http_status_reason(status: u16) -> &'static str {
+    match status {
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        _ => "",
+    }
 }
 
 fn validate_scan_path(path: PathBuf) -> Option<PathBuf> {
@@ -735,23 +1031,12 @@ fn start_llm_processing(
 ) -> (Option<UnknownBatchSender>, Option<LlmResultReceiver>) {
     if !classifier.has_llm() {
         app.llm_online = false;
-        app.llm_status = if app.llm_status == LlmStatus::NeedsSetup || app.llm_enabled {
-            LlmStatus::NeedsSetup
-        } else {
-            LlmStatus::Disabled
-        };
         return (None, None);
     }
 
     let (unknown_tx, unknown_rx) = crossbeam_channel::unbounded();
     let (result_tx, result_rx) = crossbeam_channel::unbounded();
     classifier.start_llm_classifier(unknown_rx, result_tx);
-    app.llm_online = true;
-    let provider = match app.llm_status {
-        LlmStatus::Ready(provider) => provider,
-        _ => app.preferences.llm.active_provider,
-    };
-    app.llm_status = LlmStatus::Ready(provider);
     (Some(unknown_tx), Some(result_rx))
 }
 
@@ -759,13 +1044,17 @@ fn queue_unknown_entry(
     entry: &mut FileEntry,
     pending_unknowns: &mut Vec<UnknownEntry>,
     unknown_tx: Option<&crossbeam_channel::Sender<Vec<UnknownEntry>>>,
+    mark_pending_without_worker: bool,
 ) {
     if entry.safety != SafetyLevel::Unknown {
         return;
     }
 
-    if let Some(tx) = unknown_tx {
+    if unknown_tx.is_some() || mark_pending_without_worker {
         entry.safety_reason = "Analyzing with LLM...".to_string();
+    }
+
+    if let Some(tx) = unknown_tx {
         pending_unknowns.push(UnknownEntry {
             path: entry.path.clone(),
             size: entry.size,
@@ -991,6 +1280,8 @@ fn find_default_rules() -> Option<PathBuf> {
 mod tests {
     use std::collections::HashMap;
     use std::fs;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::path::PathBuf;
 
     use crate::{Cli, EnvOverrides};
@@ -1000,18 +1291,48 @@ mod tests {
     use purifier_core::types::{Category, FileEntry, SafetyLevel};
 
     use super::{
-        apply_llm_results, apply_runtime_config, apply_startup_config, apply_startup_messages,
-        build_tree, build_tree_snapshot, load_app_config, normalize_scan_path, queue_unknown_entry,
-        refresh_scan_snapshot, requeue_unknown_entries_for_visible_tree, reset_pending_llm_labels,
+        apply_llm_results, apply_runtime_config, apply_runtime_connection_event,
+        apply_startup_config, apply_startup_messages, build_tree, build_tree_snapshot,
+        load_app_config, normalize_scan_path, queue_unknown_entry, refresh_scan_snapshot,
+        requeue_unknown_entries_for_visible_tree, reset_pending_llm_labels,
         reset_pending_llm_labels_in_state, resolve_initial_scan_path, start_llm_processing,
-        RuntimeConfig,
+        start_runtime_connection_check, RuntimeConfig,
     };
     use crate::app::{App, LlmStatus, ScanStatus};
     use crate::config::AppConfig;
     use purifier_core::classifier::Classifier;
 
+    fn spawn_http_server(
+        status_line: &'static str,
+        body: &'static str,
+        delay_before_response: Option<std::time::Duration>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
+        let address = listener
+            .local_addr()
+            .expect("test server should have a local address");
+
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("test server should accept");
+            let mut buffer = [0_u8; 4096];
+            let _ = stream.read(&mut buffer);
+            if let Some(delay) = delay_before_response {
+                std::thread::sleep(delay);
+            }
+            let response = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("test server should respond");
+        });
+
+        format!("http://{address}")
+    }
+
     #[test]
-    fn start_llm_processing_should_mark_app_online_when_classifier_has_llm() {
+    fn start_llm_processing_should_not_mark_app_online_just_for_worker_startup() {
         let classifier = Classifier::new(
             RulesEngine::new(&[]).expect("rules engine should initialize"),
             Some(LlmClient::OpenRouter(OpenRouterClient::new(
@@ -1024,12 +1345,17 @@ mod tests {
             ))),
         );
         let mut app = App::new(Some(PathBuf::from("/scan")), true, AppConfig::default());
+        app.llm_status = LlmStatus::Connecting(ProviderKind::OpenRouter);
 
         let (unknown_tx, result_rx) = start_llm_processing(&classifier, &mut app);
 
         assert!(unknown_tx.is_some(), "worker sender should exist");
         assert!(result_rx.is_some(), "worker receiver should exist");
-        assert!(app.llm_online, "LLM should be marked online");
+        assert!(!app.llm_online, "worker startup should not mark LLM online");
+        assert_eq!(
+            app.llm_status,
+            LlmStatus::Connecting(ProviderKind::OpenRouter)
+        );
     }
 
     #[test]
@@ -1062,7 +1388,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut entry = FileEntry::new(PathBuf::from("/scan/49"), 1, false, None);
 
-        queue_unknown_entry(&mut entry, &mut pending, Some(&unknown_tx));
+        queue_unknown_entry(&mut entry, &mut pending, Some(&unknown_tx), false);
 
         let batch = unknown_rx.try_recv().expect("full batch should flush");
         assert_eq!(batch.len(), 50, "batch should contain 50 entries");
@@ -1093,6 +1419,28 @@ mod tests {
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].path, PathBuf::from("/scan/unknown"));
         assert_eq!(app.entries[0].safety_reason, "Analyzing with LLM...");
+    }
+
+    #[test]
+    fn queue_unknown_entry_should_mark_connecting_rows_pending_before_failure_reset() {
+        let mut entry = FileEntry::new(PathBuf::from("/scan/unknown"), 10, false, None);
+        let mut pending = Vec::new();
+
+        queue_unknown_entry(&mut entry, &mut pending, None, true);
+
+        assert!(
+            pending.is_empty(),
+            "connecting rows should not queue without a worker"
+        );
+        assert_eq!(entry.safety_reason, "Analyzing with LLM...");
+
+        let mut entries = vec![entry];
+        reset_pending_llm_labels(&mut entries);
+
+        assert_eq!(
+            entries[0].safety_reason,
+            "Could not classify — review manually"
+        );
     }
 
     #[test]
@@ -1430,7 +1778,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_runtime_config_should_mark_llm_ready_when_provider_is_resolved() {
+    fn apply_runtime_config_should_mark_live_provider_as_connecting_before_validation() {
         let runtime_config = RuntimeConfig {
             scan_path: Some(PathBuf::from("/scan")),
             provider: Some(ResolvedProviderConfig::new(
@@ -1446,8 +1794,166 @@ mod tests {
 
         apply_runtime_config(&mut app, &runtime_config);
 
-        assert_eq!(app.llm_status, LlmStatus::Ready(ProviderKind::OpenRouter));
+        assert_eq!(
+            app.llm_status,
+            LlmStatus::Connecting(ProviderKind::OpenRouter)
+        );
         assert!(app.llm_enabled);
+        assert!(!app.llm_online);
+    }
+
+    #[test]
+    fn start_runtime_connection_check_should_return_immediately_while_validation_runs() {
+        let runtime_config = RuntimeConfig {
+            scan_path: Some(PathBuf::from("/scan")),
+            provider: Some(ResolvedProviderConfig::new(
+                ProviderKind::OpenRouter,
+                Some("test-key".to_string()),
+                "google/gemini-2.0-flash-001".to_string(),
+                spawn_http_server(
+                    "200 OK",
+                    r#"{"choices":[{"message":{"content":"[{\"path\":\"/tmp/purifier-validation\",\"category\":\"BuildArtifact\",\"safety\":\"Safe\",\"reason\":\"Validation probe\"}]"}}]}"#,
+                    Some(std::time::Duration::from_millis(250)),
+                ),
+            )),
+            show_onboarding: false,
+            llm_enabled: true,
+        };
+        let mut app = App::new(Some(PathBuf::from("/scan")), true, AppConfig::default());
+        let classifier = Classifier::new(RulesEngine::new(&[]).unwrap(), None);
+
+        apply_runtime_config(&mut app, &runtime_config);
+        let started_at = std::time::Instant::now();
+        let validation_rx = start_runtime_connection_check(&app, &classifier, &runtime_config);
+
+        assert!(validation_rx.is_some());
+        assert!(started_at.elapsed() < std::time::Duration::from_millis(100));
+        assert_eq!(
+            app.llm_status,
+            LlmStatus::Connecting(ProviderKind::OpenRouter)
+        );
+        assert!(!app.llm_online);
+    }
+
+    #[test]
+    fn apply_runtime_connection_event_should_promote_connecting_provider_to_ready() {
+        let provider = ResolvedProviderConfig::new(
+            ProviderKind::OpenRouter,
+            Some("test-key".to_string()),
+            "google/gemini-2.0-flash-001".to_string(),
+            "https://openrouter.ai/api/v1".to_string(),
+        );
+        let mut app = App::new(Some(PathBuf::from("/scan")), true, AppConfig::default());
+        app.llm_status = LlmStatus::Connecting(ProviderKind::OpenRouter);
+        app.llm_connection_generation = 1;
+        let mut classifier = Classifier::new(RulesEngine::new(&[]).unwrap(), None);
+
+        apply_runtime_connection_event(
+            &mut app,
+            &mut classifier,
+            super::RuntimeConnectionEvent::Validated {
+                generation: 1,
+                provider: ProviderKind::OpenRouter,
+                client: LlmClient::OpenRouter(OpenRouterClient::new(provider.clone())),
+            },
+        );
+
+        assert_eq!(app.llm_status, LlmStatus::Ready(ProviderKind::OpenRouter));
+        assert!(app.llm_online);
+        assert!(classifier.has_llm());
+    }
+
+    #[test]
+    fn apply_runtime_connection_event_should_surface_concise_diagnostic_failure_details() {
+        let mut app = App::new(Some(PathBuf::from("/scan")), true, AppConfig::default());
+        app.llm_status = LlmStatus::Connecting(ProviderKind::OpenRouter);
+        app.llm_connection_generation = 2;
+        let mut classifier = Classifier::new(RulesEngine::new(&[]).unwrap(), None);
+
+        apply_runtime_connection_event(
+            &mut app,
+            &mut classifier,
+            super::RuntimeConnectionEvent::Failed {
+                generation: 2,
+                provider: ProviderKind::OpenRouter,
+                detail: super::RuntimeConnectionFailure::Http {
+                    status: 400,
+                    body: Some("The model gpt-missing does not exist".to_string()),
+                },
+            },
+        );
+
+        assert_eq!(
+            app.llm_status,
+            LlmStatus::Error("OpenRouter model failed".to_string())
+        );
+        assert!(!app.llm_online);
+        assert!(!classifier.has_llm());
+        assert_eq!(
+            app.last_error.as_deref(),
+            Some(
+                "OpenRouter connection failed: HTTP 400 Bad Request - The model gpt-missing does not exist. Check the API key, model, base URL, or network, then update settings after scan completion."
+            )
+        );
+    }
+
+    #[test]
+    fn apply_runtime_connection_event_should_ignore_stale_results_after_generation_changes() {
+        let provider = ResolvedProviderConfig::new(
+            ProviderKind::OpenRouter,
+            Some("test-key".to_string()),
+            "google/gemini-2.0-flash-001".to_string(),
+            "https://openrouter.ai/api/v1".to_string(),
+        );
+        let mut app = App::new(Some(PathBuf::from("/scan")), true, AppConfig::default());
+        app.llm_status = LlmStatus::Connecting(ProviderKind::OpenAI);
+        app.llm_connection_generation = 9;
+        let mut classifier = Classifier::new(RulesEngine::new(&[]).unwrap(), None);
+
+        apply_runtime_connection_event(
+            &mut app,
+            &mut classifier,
+            super::RuntimeConnectionEvent::Validated {
+                generation: 8,
+                provider: ProviderKind::OpenRouter,
+                client: LlmClient::OpenRouter(OpenRouterClient::new(provider)),
+            },
+        );
+
+        assert_eq!(app.llm_status, LlmStatus::Connecting(ProviderKind::OpenAI));
+        assert!(!app.llm_online);
+        assert!(!classifier.has_llm());
+    }
+
+    #[test]
+    fn apply_runtime_connection_event_should_surface_invalid_response_failures() {
+        let mut app = App::new(Some(PathBuf::from("/scan")), true, AppConfig::default());
+        app.llm_status = LlmStatus::Connecting(ProviderKind::OpenAI);
+        app.llm_connection_generation = 3;
+        let mut classifier = Classifier::new(RulesEngine::new(&[]).unwrap(), None);
+
+        apply_runtime_connection_event(
+            &mut app,
+            &mut classifier,
+            super::RuntimeConnectionEvent::Failed {
+                generation: 3,
+                provider: ProviderKind::OpenAI,
+                detail: super::RuntimeConnectionFailure::InvalidResponse(
+                    "LLM validation response contained no choices".to_string(),
+                ),
+            },
+        );
+
+        assert_eq!(
+            app.llm_status,
+            LlmStatus::Error("OpenAI response failed".to_string())
+        );
+        assert_eq!(
+            app.last_error.as_deref(),
+            Some(
+                "OpenAI connection failed: LLM validation response contained no choices. Check the API key, model, base URL, or network, then update settings after scan completion."
+            )
+        );
     }
 
     #[test]
@@ -1738,6 +2244,9 @@ mod resolve_runtime_config_tests {
 
 #[cfg(test)]
 mod persist_settings_tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
     use purifier_core::classifier::Classifier;
     use purifier_core::provider::ProviderKind;
     use purifier_core::rules::RulesEngine;
@@ -1746,6 +2255,35 @@ mod persist_settings_tests {
     use crate::app::{App, AppModal, LlmStatus, SettingsDraft};
     use crate::config::AppConfig;
     use crate::secrets::{FakeSecretStore, SecretStore, SecretStoreError};
+
+    fn spawn_http_server(
+        status_line: &'static str,
+        body: &'static str,
+        delay_before_response: Option<std::time::Duration>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
+        let address = listener
+            .local_addr()
+            .expect("test server should have a local address");
+
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("test server should accept");
+            let mut buffer = [0_u8; 1024];
+            let _ = stream.read(&mut buffer);
+            if let Some(delay) = delay_before_response {
+                std::thread::sleep(delay);
+            }
+            let response = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("test server should respond");
+        });
+
+        format!("http://{address}")
+    }
 
     struct FailingSecretStore;
 
@@ -1882,7 +2420,11 @@ mod persist_settings_tests {
             api_key_edited: true,
             api_key_editing: false,
             model: "google/gemini-2.0-flash-001".to_string(),
-            base_url: "https://openrouter.ai/api/v1".to_string(),
+            base_url: spawn_http_server(
+                "200 OK",
+                r#"{"choices":[{"message":{"content":"[{\"path\":\"/tmp/purifier-validation\",\"category\":\"BuildArtifact\",\"safety\":\"Safe\",\"reason\":\"Validation probe\"}]"}}]}"#,
+                None,
+            ),
             llm_enabled: true,
         };
         let mut app = App::new(
@@ -1893,12 +2435,14 @@ mod persist_settings_tests {
         app.modal = Some(AppModal::Settings(draft.clone()));
 
         let mut classifier = Classifier::new(RulesEngine::new(&[]).unwrap(), None);
+        let mut runtime_connection_rx = None;
         let result = super::apply_settings_save(
             &mut app,
             &config_path,
             draft,
             &mut FailingSecretStore,
             &mut classifier,
+            &mut runtime_connection_rx,
             &super::Cli {
                 path: None,
                 rules: None,
@@ -1941,6 +2485,7 @@ mod persist_settings_tests {
         let mut secrets = FakeSecretStore::default();
 
         let mut classifier = Classifier::new(RulesEngine::new(&[]).unwrap(), None);
+        let mut runtime_connection_rx = None;
 
         super::apply_settings_save(
             &mut app,
@@ -1948,6 +2493,7 @@ mod persist_settings_tests {
             draft,
             &mut secrets,
             &mut classifier,
+            &mut runtime_connection_rx,
             &super::Cli {
                 path: None,
                 rules: None,
@@ -1964,6 +2510,7 @@ mod persist_settings_tests {
         assert!(!app.llm_enabled);
         assert_eq!(app.llm_status, LlmStatus::Disabled);
         assert!(app.last_error.is_none());
+        assert!(runtime_connection_rx.is_none());
         assert_eq!(
             app.last_warning.as_deref(),
             Some(
@@ -1982,7 +2529,11 @@ mod persist_settings_tests {
             api_key_edited: true,
             api_key_editing: false,
             model: "google/gemini-2.0-flash-001".to_string(),
-            base_url: "https://openrouter.ai/api/v1".to_string(),
+            base_url: spawn_http_server(
+                "200 OK",
+                r#"{"choices":[{"message":{"content":"[{\"path\":\"/tmp/purifier-validation\",\"category\":\"BuildArtifact\",\"safety\":\"Safe\",\"reason\":\"Validation probe\"}]"}}]}"#,
+                None,
+            ),
             llm_enabled: true,
         };
         let mut app = App::new(
@@ -1993,6 +2544,7 @@ mod persist_settings_tests {
         app.modal = Some(AppModal::Settings(draft.clone()));
         let mut classifier = Classifier::new(RulesEngine::new(&[]).unwrap(), None);
         let mut secrets = FakeSecretStore::default();
+        let mut runtime_connection_rx = None;
 
         super::apply_settings_save(
             &mut app,
@@ -2000,6 +2552,7 @@ mod persist_settings_tests {
             draft,
             &mut secrets,
             &mut classifier,
+            &mut runtime_connection_rx,
             &super::Cli {
                 path: None,
                 rules: None,
@@ -2011,14 +2564,164 @@ mod persist_settings_tests {
         )
         .unwrap();
 
-        assert!(app.modal.is_none());
+        assert!(matches!(app.modal, Some(AppModal::Settings(_))));
         assert_eq!(
             app.preferences.llm.active_provider,
             ProviderKind::OpenRouter
         );
         assert!(app.llm_enabled);
+        assert_eq!(
+            app.llm_status,
+            LlmStatus::Connecting(ProviderKind::OpenRouter)
+        );
+        assert!(!classifier.has_llm());
+        let event = runtime_connection_rx
+            .as_ref()
+            .expect("validation should start for live provider")
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("validation result should arrive");
+        super::apply_runtime_connection_event(&mut app, &mut classifier, event);
+        assert!(app.modal.is_none());
         assert_eq!(app.llm_status, LlmStatus::Ready(ProviderKind::OpenRouter));
         assert!(classifier.has_llm());
+    }
+
+    #[test]
+    fn apply_settings_save_should_surface_live_connection_failures_after_persisting() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config_path = tempdir.path().join("config.toml");
+        let draft = SettingsDraft {
+            provider: ProviderKind::OpenRouter,
+            api_key: "bad-key".to_string(),
+            api_key_edited: true,
+            api_key_editing: false,
+            model: "google/gemini-2.0-flash-001".to_string(),
+            base_url: spawn_http_server(
+                "401 Unauthorized",
+                r#"{"error":{"message":"Invalid API key"}}"#,
+                None,
+            ),
+            llm_enabled: true,
+        };
+        let mut app = App::new(
+            Some(std::path::PathBuf::from("/")),
+            false,
+            AppConfig::default(),
+        );
+        app.modal = Some(AppModal::Settings(draft.clone()));
+        let mut classifier = Classifier::new(RulesEngine::new(&[]).unwrap(), None);
+        let mut secrets = FakeSecretStore::default();
+        let mut runtime_connection_rx = None;
+
+        super::apply_settings_save(
+            &mut app,
+            &config_path,
+            draft,
+            &mut secrets,
+            &mut classifier,
+            &mut runtime_connection_rx,
+            &super::Cli {
+                path: None,
+                rules: None,
+                no_llm: false,
+                api_key: None,
+                provider: None,
+            },
+            &super::EnvOverrides::default(),
+        )
+        .unwrap();
+
+        assert!(matches!(app.modal, Some(AppModal::Settings(_))));
+        assert!(app.llm_enabled);
+        assert_eq!(
+            app.llm_status,
+            LlmStatus::Connecting(ProviderKind::OpenRouter)
+        );
+        assert!(!app.llm_online);
+        assert!(!classifier.has_llm());
+        let event = runtime_connection_rx
+            .as_ref()
+            .expect("validation should start for live provider")
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("validation result should arrive");
+        super::apply_runtime_connection_event(&mut app, &mut classifier, event);
+        assert_eq!(
+            app.llm_status,
+            LlmStatus::Error("OpenRouter auth failed".to_string())
+        );
+        assert_eq!(
+            app.settings_modal_error.as_deref(),
+            Some(
+                "OpenRouter connection failed: HTTP 401 Unauthorized - Invalid API key. Update the API key or provider and save again."
+            )
+        );
+        assert!(matches!(app.modal, Some(AppModal::Settings(_))));
+    }
+
+    #[test]
+    fn apply_settings_save_should_only_mark_live_provider_ready_after_connection_succeeds() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config_path = tempdir.path().join("config.toml");
+        let draft = SettingsDraft {
+            provider: ProviderKind::OpenRouter,
+            api_key: "or-key".to_string(),
+            api_key_edited: true,
+            api_key_editing: false,
+            model: "google/gemini-2.0-flash-001".to_string(),
+            base_url: spawn_http_server(
+                "200 OK",
+                r#"{"choices":[{"message":{"content":"[{\"path\":\"/tmp/purifier-validation\",\"category\":\"BuildArtifact\",\"safety\":\"Safe\",\"reason\":\"Validation probe\"}]"}}]}"#,
+                None,
+            ),
+            llm_enabled: true,
+        };
+        let mut app = App::new(
+            Some(std::path::PathBuf::from("/")),
+            false,
+            AppConfig::default(),
+        );
+        app.modal = Some(AppModal::Settings(draft.clone()));
+        let mut classifier = Classifier::new(RulesEngine::new(&[]).unwrap(), None);
+        let mut secrets = FakeSecretStore::default();
+        let mut runtime_connection_rx = None;
+
+        super::apply_settings_save(
+            &mut app,
+            &config_path,
+            draft,
+            &mut secrets,
+            &mut classifier,
+            &mut runtime_connection_rx,
+            &super::Cli {
+                path: None,
+                rules: None,
+                no_llm: false,
+                api_key: None,
+                provider: None,
+            },
+            &super::EnvOverrides::default(),
+        )
+        .unwrap();
+
+        assert!(matches!(app.modal, Some(AppModal::Settings(_))));
+        assert!(app.llm_enabled);
+        assert_eq!(
+            app.llm_status,
+            LlmStatus::Connecting(ProviderKind::OpenRouter)
+        );
+        assert!(!app.llm_online);
+        assert!(!classifier.has_llm());
+        let event = runtime_connection_rx
+            .as_ref()
+            .expect("validation should start for live provider")
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("validation result should arrive");
+        super::apply_runtime_connection_event(&mut app, &mut classifier, event);
+        assert!(app.modal.is_none());
+        assert_eq!(app.llm_status, LlmStatus::Ready(ProviderKind::OpenRouter));
+        assert!(app.llm_online);
+        assert!(classifier.has_llm());
+        assert!(app.last_error.is_none());
     }
 
     #[test]
@@ -2042,6 +2745,7 @@ mod persist_settings_tests {
         app.modal = Some(AppModal::Settings(draft.clone()));
         let mut classifier = Classifier::new(RulesEngine::new(&[]).unwrap(), None);
         let mut secrets = FakeSecretStore::default();
+        let mut runtime_connection_rx = None;
         let cli = super::Cli {
             path: None,
             rules: None,
@@ -2056,6 +2760,7 @@ mod persist_settings_tests {
             draft,
             &mut secrets,
             &mut classifier,
+            &mut runtime_connection_rx,
             &cli,
             &super::EnvOverrides::default(),
         )
@@ -2064,6 +2769,123 @@ mod persist_settings_tests {
         assert!(!app.llm_enabled);
         assert_eq!(app.llm_status, LlmStatus::Disabled);
         assert!(!classifier.has_llm());
+        assert!(runtime_connection_rx.is_none());
+        assert_eq!(
+            app.last_warning.as_deref(),
+            Some(
+                "Launch-time CLI/env overrides still control the live runtime; restart without overrides to use saved settings"
+            )
+        );
+    }
+
+    #[test]
+    fn apply_settings_save_should_close_modal_when_cli_override_changes_live_runtime_target() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config_path = tempdir.path().join("config.toml");
+        let draft = SettingsDraft {
+            provider: ProviderKind::OpenRouter,
+            api_key: "or-key".to_string(),
+            api_key_edited: true,
+            api_key_editing: false,
+            model: "google/gemini-2.0-flash-001".to_string(),
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            llm_enabled: true,
+        };
+        let mut app = App::new(
+            Some(std::path::PathBuf::from("/")),
+            false,
+            AppConfig::default(),
+        );
+        app.modal = Some(AppModal::Settings(draft.clone()));
+        let mut classifier = Classifier::new(RulesEngine::new(&[]).unwrap(), None);
+        let mut secrets = FakeSecretStore::default();
+        let mut runtime_connection_rx = None;
+        let cli = super::Cli {
+            path: None,
+            rules: None,
+            no_llm: false,
+            api_key: Some("cli-openai-key".to_string()),
+            provider: Some(ProviderKind::OpenAI),
+        };
+
+        super::apply_settings_save(
+            &mut app,
+            &config_path,
+            draft,
+            &mut secrets,
+            &mut classifier,
+            &mut runtime_connection_rx,
+            &cli,
+            &super::EnvOverrides::default(),
+        )
+        .unwrap();
+
+        assert!(app.modal.is_none());
+        assert!(!app.settings_modal_is_saving);
+        assert!(app.pending_settings_validation_generation.is_none());
+        assert_eq!(app.llm_status, LlmStatus::Connecting(ProviderKind::OpenAI));
+        assert!(runtime_connection_rx.is_some());
+        assert_eq!(
+            app.last_warning.as_deref(),
+            Some(
+                "Launch-time CLI/env overrides still control the live runtime; restart without overrides to use saved settings"
+            )
+        );
+    }
+
+    #[test]
+    fn apply_settings_save_should_close_modal_when_env_override_controls_live_runtime() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config_path = tempdir.path().join("config.toml");
+        let draft = SettingsDraft {
+            provider: ProviderKind::OpenRouter,
+            api_key: "saved-or-key".to_string(),
+            api_key_edited: true,
+            api_key_editing: false,
+            model: "google/gemini-2.0-flash-001".to_string(),
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            llm_enabled: true,
+        };
+        let mut app = App::new(
+            Some(std::path::PathBuf::from("/")),
+            false,
+            AppConfig::default(),
+        );
+        app.modal = Some(AppModal::Settings(draft.clone()));
+        let mut classifier = Classifier::new(RulesEngine::new(&[]).unwrap(), None);
+        let mut secrets = FakeSecretStore::default();
+        let mut runtime_connection_rx = None;
+        let env = super::EnvOverrides {
+            openrouter_api_key: Some("env-openrouter-key".to_string()),
+            ..super::EnvOverrides::default()
+        };
+
+        super::apply_settings_save(
+            &mut app,
+            &config_path,
+            draft,
+            &mut secrets,
+            &mut classifier,
+            &mut runtime_connection_rx,
+            &super::Cli {
+                path: None,
+                rules: None,
+                no_llm: false,
+                api_key: None,
+                provider: None,
+            },
+            &env,
+        )
+        .unwrap();
+
+        assert!(app.modal.is_none());
+        assert!(!app.settings_modal_is_saving);
+        assert!(app.pending_settings_validation_generation.is_none());
+        assert_eq!(
+            app.llm_status,
+            LlmStatus::Connecting(ProviderKind::OpenRouter)
+        );
+        assert!(runtime_connection_rx.is_some());
         assert_eq!(
             app.last_warning.as_deref(),
             Some(
@@ -2085,12 +2907,14 @@ mod persist_settings_tests {
         app.preferences.onboarding.first_launch_prompt_dismissed = false;
         let mut classifier = Classifier::new(RulesEngine::new(&[]).unwrap(), None);
         let mut secrets = FakeSecretStore::default();
+        let mut runtime_connection_rx = None;
 
         super::apply_onboarding_skip(
             &mut app,
             &config_path,
             &mut secrets,
             &mut classifier,
+            &mut runtime_connection_rx,
             &super::Cli {
                 path: None,
                 rules: None,
@@ -2105,5 +2929,6 @@ mod persist_settings_tests {
         assert!(app.preferences.onboarding.first_launch_prompt_dismissed);
         assert_eq!(app.llm_status, LlmStatus::Disabled);
         assert!(!app.llm_enabled);
+        assert!(runtime_connection_rx.is_none());
     }
 }

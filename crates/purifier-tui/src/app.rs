@@ -82,11 +82,8 @@ pub enum AppScreen {
 pub enum LlmStatus {
     Disabled,
     NeedsSetup,
+    Connecting(ProviderKind),
     Ready(ProviderKind),
-    #[expect(
-        dead_code,
-        reason = "Error state is reserved for follow-up settings flow"
-    )]
     Error(String),
 }
 
@@ -123,6 +120,9 @@ pub struct App {
     pub should_quit: bool,
     pub preferences: AppConfig,
     pub modal: Option<AppModal>,
+    pub settings_modal_is_saving: bool,
+    pub settings_modal_error: Option<String>,
+    pub pending_settings_validation_generation: Option<u64>,
     pub last_error: Option<String>,
     pub last_warning: Option<String>,
     pub expanded_paths: HashSet<PathBuf>,
@@ -130,6 +130,7 @@ pub struct App {
     pub llm_enabled: bool,
     pub llm_status: LlmStatus,
     pub llm_online: bool,
+    pub llm_connection_generation: u64,
     pub flat_entries: Vec<FlatEntry>,
     // Scan progress (live during scan)
     pub files_scanned: u64,
@@ -181,6 +182,9 @@ impl App {
             should_quit: false,
             preferences,
             modal: None,
+            settings_modal_is_saving: false,
+            settings_modal_error: None,
+            pending_settings_validation_generation: None,
             last_error: None,
             last_warning: None,
             expanded_paths: HashSet::new(),
@@ -192,6 +196,7 @@ impl App {
                 LlmStatus::Disabled
             },
             llm_online: false,
+            llm_connection_generation: 0,
             flat_entries: Vec::new(),
             files_scanned: 0,
             bytes_found: 0,
@@ -204,11 +209,17 @@ impl App {
     }
 
     pub fn open_settings(&mut self) {
+        self.settings_modal_is_saving = false;
+        self.settings_modal_error = None;
+        self.pending_settings_validation_generation = None;
         self.modal = Some(AppModal::Settings(self.build_settings_draft()));
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn open_onboarding(&mut self) {
+        self.settings_modal_is_saving = false;
+        self.settings_modal_error = None;
+        self.pending_settings_validation_generation = None;
         self.modal = Some(AppModal::Onboarding(self.build_settings_draft()));
     }
 
@@ -218,6 +229,9 @@ impl App {
 
     pub fn close_modal(&mut self) {
         self.modal = None;
+        self.settings_modal_is_saving = false;
+        self.settings_modal_error = None;
+        self.pending_settings_validation_generation = None;
     }
 
     fn build_settings_draft(&self) -> SettingsDraft {

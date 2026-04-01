@@ -8,6 +8,14 @@ use ratatui::Frame;
 
 use crate::app::{App, AppModal, AppScreen, View};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MainLayout {
+    pub tabs: ratatui::layout::Rect,
+    pub main: ratatui::layout::Rect,
+    pub info: ratatui::layout::Rect,
+    pub status: ratatui::layout::Rect,
+}
+
 pub fn draw(frame: &mut Frame, app: &App) {
     match app.screen {
         AppScreen::DirPicker => {
@@ -24,31 +32,42 @@ pub fn draw(frame: &mut Frame, app: &App) {
 }
 
 fn draw_main(frame: &mut Frame, app: &App) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // tab bar
-            Constraint::Min(5),    // main content
-            Constraint::Length(3), // info panel
-            Constraint::Length(1), // status bar
-        ])
-        .split(frame.area());
+    let layout = main_layout(frame.area());
 
-    draw_tab_bar(frame, app, chunks[0]);
+    draw_tab_bar(frame, app, layout.tabs);
 
     match app.current_view {
         View::BySize | View::ByType | View::BySafety | View::ByAge => {
-            tree_view::draw(frame, app, chunks[1], chunks[2]);
+            tree_view::draw(frame, app, layout.main, layout.info);
         }
     }
 
-    status_bar::draw(frame, app, chunks[3]);
+    status_bar::draw(frame, app, layout.status);
 
     if matches!(app.modal, Some(AppModal::DeleteConfirm)) {
         let Some(modal) = app.modal.as_ref() else {
             return;
         };
         draw_modal(frame, app, modal);
+    }
+}
+
+pub(crate) fn main_layout(area: ratatui::layout::Rect) -> MainLayout {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(5),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    MainLayout {
+        tabs: chunks[0],
+        main: chunks[1],
+        info: chunks[2],
+        status: chunks[3],
     }
 }
 

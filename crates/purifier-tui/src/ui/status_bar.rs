@@ -59,6 +59,10 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         LlmStatus::NeedsSetup => {
             Span::styled(" | LLM: needs setup", Style::default().fg(Color::Yellow))
         }
+        LlmStatus::Connecting(provider) => Span::styled(
+            format!(" | LLM: connecting {:?}", provider),
+            Style::default().fg(Color::Yellow),
+        ),
         LlmStatus::Ready(provider) => Span::styled(
             format!(" | LLM: {:?}", provider),
             Style::default().fg(Color::Green),
