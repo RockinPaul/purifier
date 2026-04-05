@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::size::{EntrySizes, FileIdentity, SizeMode};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Category {
     BuildArtifact,
     Cache,

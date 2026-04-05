@@ -9,6 +9,14 @@ use purifier_core::DeleteOutcome;
 use crate::columns::{find_children, find_entry, sorted_children_cached, ColumnStack};
 use crate::config::AppConfig;
 use crate::marks::MarkSet;
+use crate::ui::preview_pane::{aggregate_by_age, aggregate_by_category};
+
+/// Cached preview analytics for the currently selected directory.
+#[derive(Debug, Clone)]
+pub struct PreviewAnalytics {
+    pub by_category: Vec<(Category, u64)>,
+    pub by_age: Vec<(&'static str, u64)>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanStatus {
@@ -100,6 +108,11 @@ pub struct App {
     // Precomputed total sizes: path → (logical_total, physical_total)
     // Populated once after scan completes. O(1) lookup instead of O(subtree).
     pub size_cache: HashMap<PathBuf, (u64, u64)>,
+    // Sorted indices cache: path → sorted child indices. Populated before each draw.
+    pub sorted_cache: HashMap<PathBuf, Vec<usize>>,
+    // Preview analytics cache for the selected directory.
+    pub preview_cache: Option<PreviewAnalytics>,
+    pub preview_cache_path: Option<PathBuf>,
     // Batch review scroll position
     pub batch_review_selected: usize,
     // Directory picker
@@ -162,6 +175,9 @@ impl App {
             llm_classified_count: 0,
             llm_pending_count: 0,
             size_cache: HashMap::new(),
+            sorted_cache: HashMap::new(),
+            preview_cache: None,
+            preview_cache_path: None,
             batch_review_selected: 0,
             dir_picker_options,
             dir_picker_selected: 0,
@@ -250,6 +266,9 @@ impl App {
         self.deleted_paths.clear();
         self.llm_classified_count = 0;
         self.llm_pending_count = 0;
+        self.sorted_cache.clear();
+        self.preview_cache = None;
+        self.preview_cache_path = None;
     }
 
     // -- Size mode --
@@ -280,6 +299,99 @@ impl App {
             SizeMode::Physical => self.physical_bytes_found,
             SizeMode::Logical => self.logical_bytes_found,
         };
+    }
+
+    // -- Cache invalidation --
+
+    /// Clear all render caches. Call after: sort key change, size mode change,
+    /// scan complete, deletion, LLM classification update.
+    pub fn invalidate_caches(&mut self) {
+        self.sorted_cache.clear();
+        self.preview_cache = None;
+        self.preview_cache_path = None;
+    }
+
+    /// Clear just the preview cache. Call after: j/k movement, h/l navigation.
+    pub fn invalidate_preview_cache(&mut self) {
+        self.preview_cache = None;
+        self.preview_cache_path = None;
+    }
+
+    /// Precompute sorted indices and preview analytics for the current frame.
+    /// Called once before draw. Render functions do pure O(1) lookups after this.
+    pub fn refresh_frame_cache(&mut self) {
+        let sort_key = self.columns.sort_key;
+        let mode = self.size_mode();
+
+        // Cap sorted_cache size to prevent unbounded growth
+        if self.sorted_cache.len() > 16 {
+            self.sorted_cache.clear();
+        }
+
+        // Parent column
+        if let Some(parent) = self.columns.parent() {
+            let parent_path = parent.path.clone();
+            if !self.sorted_cache.contains_key(&parent_path) {
+                if let Some(children) = self.children_at_path(&parent_path) {
+                    let cache = &self.size_cache;
+                    let sorted = sorted_children_cached(children, sort_key, |e| {
+                        cache.get(&e.path).map(|&(l, p)| match mode {
+                            SizeMode::Logical => l,
+                            SizeMode::Physical => p,
+                        }).unwrap_or(0)
+                    });
+                    self.sorted_cache.insert(parent_path, sorted);
+                }
+            }
+        }
+
+        // Current column
+        let current_path = self.columns.current_path().to_path_buf();
+        if !self.sorted_cache.contains_key(&current_path) {
+            if let Some(children) = self.children_at_path(&current_path) {
+                let cache = &self.size_cache;
+                let sorted = sorted_children_cached(children, sort_key, |e| {
+                    cache.get(&e.path).map(|&(l, p)| match mode {
+                        SizeMode::Logical => l,
+                        SizeMode::Physical => p,
+                    }).unwrap_or(0)
+                });
+                self.sorted_cache.insert(current_path.clone(), sorted);
+            }
+        }
+
+        // Preview analytics for selected entry
+        if let Some(sorted) = self.sorted_cache.get(&current_path).cloned() {
+            let sel_idx = self.columns.current().selected_index;
+            if let Some(&idx) = sorted.get(sel_idx) {
+                if let Some(children) = self.children_at_path(&current_path) {
+                    if let Some(entry) = children.get(idx) {
+                        let selected_path = entry.path.clone();
+                        let is_dir = entry.is_dir;
+
+                        if self.preview_cache_path.as_ref() != Some(&selected_path) {
+                            if is_dir {
+                                if let Some(sel_children) = self.children_at_path(&selected_path) {
+                                    let by_category = aggregate_by_category(sel_children, &self.size_cache, mode);
+                                    let by_age = aggregate_by_age(sel_children);
+                                    self.preview_cache = Some(PreviewAnalytics { by_category, by_age });
+                                } else {
+                                    self.preview_cache = None;
+                                }
+                            } else {
+                                self.preview_cache = None;
+                            }
+                            self.preview_cache_path = Some(selected_path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// O(1) lookup of cached sorted indices for a directory.
+    pub fn get_sorted_children(&self, path: &Path) -> Option<&[usize]> {
+        self.sorted_cache.get(path).map(|v| v.as_slice())
     }
 
     // -- Size cache --
@@ -322,19 +434,25 @@ impl App {
     }
 
     /// Get the entry currently highlighted in the current column.
+    /// Uses sorted_cache for O(1) lookup when cache is warm (after refresh_frame_cache).
     pub fn selected_entry(&self) -> Option<&FileEntry> {
         let col = self.columns.current();
         let children = self.children_at_path(&col.path)?;
+
+        // Use cached sorted indices if available (fast path after refresh_frame_cache)
+        if let Some(sorted) = self.sorted_cache.get(&col.path) {
+            let idx = sorted.get(col.selected_index)?;
+            return children.get(*idx);
+        }
+
+        // Fallback: compute inline (cold cache, e.g. during tests)
         let cache = &self.size_cache;
         let mode = self.size_mode();
         let sorted = sorted_children_cached(children, self.columns.sort_key, |e| {
-            cache
-                .get(&e.path)
-                .map(|&(l, p)| match mode {
-                    SizeMode::Logical => l,
-                    SizeMode::Physical => p,
-                })
-                .unwrap_or(0)
+            cache.get(&e.path).map(|&(l, p)| match mode {
+                SizeMode::Logical => l,
+                SizeMode::Physical => p,
+            }).unwrap_or(0)
         });
         let idx = sorted.get(col.selected_index)?;
         children.get(*idx)

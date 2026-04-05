@@ -232,39 +232,29 @@ fn safety_rank(safety: SafetyLevel) -> u8 {
 }
 
 /// Find the children of a directory by path in the entry tree.
+/// Uses prefix-guided descent: only recurses into entries whose path is a prefix
+/// of the target. This is O(depth × branching) instead of O(tree_size).
 pub fn find_children<'a>(entries: &'a [FileEntry], path: &Path) -> Option<&'a [FileEntry]> {
-    // If path matches the conceptual root, entries themselves are the children
     for entry in entries {
         if entry.path == path {
             return Some(&entry.children);
         }
-        if let Some(found) = find_children_recursive(&entry.children, path) {
-            return Some(found);
-        }
-    }
-    None
-}
-
-fn find_children_recursive<'a>(entries: &'a [FileEntry], path: &Path) -> Option<&'a [FileEntry]> {
-    for entry in entries {
-        if entry.path == path {
-            return Some(&entry.children);
-        }
-        if let Some(found) = find_children_recursive(&entry.children, path) {
-            return Some(found);
+        if entry.is_dir && path.starts_with(&entry.path) {
+            return find_children(&entry.children, path);
         }
     }
     None
 }
 
 /// Find an entry by path in the entry tree.
+/// Uses prefix-guided descent: O(depth × branching) instead of O(tree_size).
 pub fn find_entry<'a>(entries: &'a [FileEntry], path: &Path) -> Option<&'a FileEntry> {
     for entry in entries {
         if entry.path == path {
             return Some(entry);
         }
-        if let Some(found) = find_entry(&entry.children, path) {
-            return Some(found);
+        if entry.is_dir && path.starts_with(&entry.path) {
+            return find_entry(&entry.children, path);
         }
     }
     None

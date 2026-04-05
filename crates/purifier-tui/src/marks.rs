@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use purifier_core::size::SizeMode;
@@ -60,6 +60,26 @@ impl MarkSet {
         let mut paths: Vec<_> = self.marked.iter().cloned().collect();
         paths.sort();
         paths
+    }
+
+    /// Sum of cached sizes for all marked paths. O(n) with zero allocation.
+    pub fn total_cached_size(
+        &self,
+        size_cache: &HashMap<PathBuf, (u64, u64)>,
+        mode: SizeMode,
+    ) -> u64 {
+        self.marked
+            .iter()
+            .map(|path| {
+                size_cache
+                    .get(path)
+                    .map(|&(l, p)| match mode {
+                        SizeMode::Logical => l,
+                        SizeMode::Physical => p,
+                    })
+                    .unwrap_or(0)
+            })
+            .sum()
     }
 }
 

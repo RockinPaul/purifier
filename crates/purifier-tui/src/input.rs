@@ -74,11 +74,23 @@ fn handle_main_analytics(app: &mut App, key: KeyEvent) -> InputResult {
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
 
-        // Navigation
-        KeyCode::Char('j') | KeyCode::Down => app.columns.move_selection(1, count),
-        KeyCode::Char('k') | KeyCode::Up => app.columns.move_selection(-1, count),
-        KeyCode::Char('g') => app.columns.jump_top(),
-        KeyCode::Char('G') => app.columns.jump_bottom(count),
+        // Navigation — only invalidate preview cache (sorted indices stay valid)
+        KeyCode::Char('j') | KeyCode::Down => {
+            app.columns.move_selection(1, count);
+            app.invalidate_preview_cache();
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.columns.move_selection(-1, count);
+            app.invalidate_preview_cache();
+        }
+        KeyCode::Char('g') => {
+            app.columns.jump_top();
+            app.invalidate_preview_cache();
+        }
+        KeyCode::Char('G') => {
+            app.columns.jump_bottom(count);
+            app.invalidate_preview_cache();
+        }
 
         // Enter directory / step into
         KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
@@ -86,6 +98,7 @@ fn handle_main_analytics(app: &mut App, key: KeyEvent) -> InputResult {
                 if entry.is_dir {
                     let path = entry.path.clone();
                     app.columns.enter(path);
+                    app.invalidate_preview_cache();
                 }
             }
         }
@@ -93,6 +106,7 @@ fn handle_main_analytics(app: &mut App, key: KeyEvent) -> InputResult {
         // Go back to parent
         KeyCode::Char('h') | KeyCode::Left => {
             app.columns.back();
+            app.invalidate_preview_cache();
         }
 
         // Go to home directory
@@ -101,23 +115,26 @@ fn handle_main_analytics(app: &mut App, key: KeyEvent) -> InputResult {
                 if home.starts_with(&app.scan_path) || app.scan_path.starts_with(&home) {
                     app.columns
                         .navigate_to(&home, &app.entries, app.size_mode());
+                    app.invalidate_caches();
                 }
             }
         }
 
-        // Sort
+        // Sort — invalidate everything (order changes)
         KeyCode::Char('s') => {
             app.columns.sort_key = app.columns.sort_key.cycle();
             app.preferences.ui.sort_key = app.columns.sort_key;
+            app.invalidate_caches();
         }
 
-        // Size mode toggle
+        // Size mode toggle — invalidate everything (sizes change)
         KeyCode::Char('i') => {
             app.preferences.ui.size_mode = match app.size_mode() {
                 SizeMode::Physical => SizeMode::Logical,
                 SizeMode::Logical => SizeMode::Physical,
             };
             app.sync_display_size_state();
+            app.invalidate_caches();
         }
 
         // Delete
@@ -237,6 +254,7 @@ fn execute_single_delete(app: &mut App, path: &std::path::Path) {
             app.mark_deleted(path);
             app.remove_entry_by_path(path);
             app.rebuild_size_cache();
+            app.invalidate_caches();
             // Adjust selection if it's now out of bounds
             let count = app.current_children_count();
             if count > 0 && app.columns.current().selected_index >= count {

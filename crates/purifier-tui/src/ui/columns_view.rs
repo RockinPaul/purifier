@@ -74,9 +74,12 @@ pub fn render_parent_column(frame: &mut Frame, area: Rect, app: &App) {
     };
 
     let mode = app.size_mode();
-    let sorted = sorted_children_cached(children, app.columns.sort_key, |e| {
-        app.cached_size(&e.path, mode)
-    });
+    let sorted = match app.get_sorted_children(&parent_col.path) {
+        Some(s) => s.to_vec(),
+        None => sorted_children_cached(children, app.columns.sort_key, |e| {
+            app.cached_size(&e.path, mode)
+        }),
+    };
     let current_dir_path = app.columns.current_path();
 
     // Reserve one row for the directory name header.
@@ -191,9 +194,12 @@ pub fn render_current_column(frame: &mut Frame, area: Rect, app: &App) {
     };
 
     let mode = app.size_mode();
-    let sorted = sorted_children_cached(children, app.columns.sort_key, |e| {
-        app.cached_size(&e.path, mode)
-    });
+    let sorted = match app.get_sorted_children(&col.path) {
+        Some(s) => s.to_vec(),
+        None => sorted_children_cached(children, app.columns.sort_key, |e| {
+            app.cached_size(&e.path, mode)
+        }),
+    };
 
     // Reserve one row for the directory name header.
     let header_area = Rect {

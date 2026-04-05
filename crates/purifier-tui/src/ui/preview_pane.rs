@@ -120,8 +120,11 @@ fn render_dir_analytics(
 
     lines.push(Line::from(""));
 
-    // By type
-    let by_category = aggregate_by_category(children, &app.size_cache, mode);
+    // By type — use cached analytics when available
+    let by_category = match &app.preview_cache {
+        Some(analytics) => analytics.by_category.clone(),
+        None => aggregate_by_category(children, &app.size_cache, mode),
+    };
     if !by_category.is_empty() {
         lines.push(Line::from(Span::styled(
             "  By type",
@@ -151,8 +154,11 @@ fn render_dir_analytics(
         lines.push(Line::from(""));
     }
 
-    // By age
-    let by_age = aggregate_by_age(children);
+    // By age — use cached analytics when available
+    let by_age = match &app.preview_cache {
+        Some(analytics) => analytics.by_age.clone(),
+        None => aggregate_by_age(children),
+    };
     if by_age.iter().any(|(_, s)| *s > 0) {
         lines.push(Line::from(Span::styled(
             "  By age",
@@ -667,19 +673,16 @@ fn relative_time(time: SystemTime) -> String {
 
 /// Aggregate children sizes by `Category`, sorted by size descending.
 pub fn aggregate_by_category(children: &[FileEntry], cache: &HashMap<PathBuf, (u64, u64)>, mode: SizeMode) -> Vec<(Category, u64)> {
-    let mut map: Vec<(Category, u64)> = Vec::new();
+    let mut map: HashMap<Category, u64> = HashMap::new();
 
     for child in children {
         let size = cache.get(&child.path).map(|&(l, p)| match mode { SizeMode::Logical => l, SizeMode::Physical => p }).unwrap_or(0);
-        if let Some(entry) = map.iter_mut().find(|(c, _)| *c == child.category) {
-            entry.1 += size;
-        } else {
-            map.push((child.category, size));
-        }
+        *map.entry(child.category).or_insert(0) += size;
     }
 
-    map.sort_by(|a, b| b.1.cmp(&a.1));
-    map
+    let mut result: Vec<_> = map.into_iter().collect();
+    result.sort_by(|a, b| b.1.cmp(&a.1));
+    result
 }
 
 /// Aggregate children sizes into three age buckets: >90 days, 30-90 days, <30 days.

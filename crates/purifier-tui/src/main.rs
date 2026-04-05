@@ -424,7 +424,10 @@ fn run_loop(
             }
         }
 
-        // 3. Draw frame
+        // 3. Precompute frame cache (sorted indices + preview analytics)
+        app.refresh_frame_cache();
+
+        // 4. Draw frame
         terminal.draw(|frame| ui::draw(frame, app))?;
 
         // 4. Wait briefly for next event (16ms ≈ 60fps)
@@ -1231,6 +1234,7 @@ fn apply_scan_update(app: &mut App, update: ScanProcessingUpdate) -> bool {
             app.skipped = result.skipped;
             app.entries = result.entries;
             app.rebuild_size_cache();
+            app.invalidate_caches();
             true
         }
     }
@@ -1382,6 +1386,7 @@ fn apply_llm_results(app: &mut App, results: Vec<LlmClassification>) {
 
     if applied_any {
         app.llm_classified_count += 1;
+        app.invalidate_caches();
     }
 }
 
