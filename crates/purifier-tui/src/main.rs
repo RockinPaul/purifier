@@ -1,6 +1,8 @@
 mod app;
+mod columns;
 mod config;
 mod input;
+mod marks;
 mod secrets;
 mod ui;
 
@@ -205,6 +207,7 @@ fn main() -> io::Result<()> {
         start_runtime_connection_check(&app, &classifier, &runtime_config);
     apply_startup_messages(&mut app, startup_warning, &cli, &env, &runtime_config);
     if runtime_config.show_onboarding {
+        app.screen = app::AppScreen::Onboarding;
         app.open_onboarding();
     }
 
@@ -418,10 +421,7 @@ fn run_loop(
                     }
                 }
                 Event::Mouse(mouse) => {
-                    let size = terminal.size()?;
-                    let layout =
-                        ui::main_layout(ratatui::layout::Rect::new(0, 0, size.width, size.height));
-                    input::handle_mouse(app, mouse, layout);
+                    input::handle_mouse(app, mouse);
                 }
                 _ => {}
             }
@@ -446,7 +446,6 @@ fn apply_settings_save(
     match persist_settings(config_path, &mut app.preferences, draft.clone(), secrets) {
         Ok(()) => {
             app.sync_display_size_state();
-            app.rebuild_flat_entries();
             let runtime_override_active =
                 refresh_runtime_state(app, classifier, runtime_connection_rx, secrets, cli, env);
 
@@ -458,7 +457,7 @@ fn apply_settings_save(
                 app.settings_modal_error = None;
                 app.pending_settings_validation_generation = Some(app.llm_connection_generation);
             } else {
-                app.close_modal();
+                app.close_preview_modal();
             }
 
             Ok(())
@@ -822,7 +821,7 @@ impl RuntimeConfig {
 )]
 fn apply_startup_config(app: &mut App, config: &config::AppConfig) {
     app.preferences = config.clone();
-    app.current_view = config.ui.default_view;
+    app.columns.sort_key = config.ui.sort_key;
 }
 
 fn apply_startup_messages(
@@ -919,7 +918,7 @@ fn apply_runtime_connection_event(
             app.last_error = None;
 
             if closes_modal {
-                app.close_modal();
+                app.close_preview_modal();
             }
         }
         RuntimeConnectionEvent::Failed {
@@ -1228,7 +1227,6 @@ fn apply_scan_update(app: &mut App, update: ScanProcessingUpdate) -> bool {
             app.total_files = result.total_entries;
             app.skipped = result.skipped;
             app.entries = result.entries;
-            app.rebuild_flat_entries();
             true
         }
     }
@@ -1288,7 +1286,6 @@ fn requeue_unknown_entries_for_visible_tree(
     for batch in batch_unknowns(collect_unknowns(&app.entries)) {
         let _ = tx.send(batch);
     }
-    app.rebuild_flat_entries();
 }
 
 fn flush_unknown_batches(
@@ -1370,7 +1367,6 @@ fn reset_pending_llm_labels(entries: &mut [FileEntry]) {
 
 fn reset_pending_llm_labels_in_state(app: &mut App) {
     reset_pending_llm_labels(&mut app.entries);
-    app.rebuild_flat_entries();
 }
 
 fn apply_llm_results(app: &mut App, results: Vec<LlmClassification>) {
@@ -1380,8 +1376,8 @@ fn apply_llm_results(app: &mut App, results: Vec<LlmClassification>) {
         applied_any |= update_entry_classification(&mut app.entries, &result);
     }
 
-    if applied_any && app.scan_status != ScanStatus::Scanning && !app.entries.is_empty() {
-        app.rebuild_flat_entries();
+    if applied_any {
+        app.llm_classified_count += 1;
     }
 }
 
@@ -1806,7 +1802,7 @@ mod tests {
         refresh_scan_snapshot(&mut app, &path_children);
 
         assert!(
-            app.flat_entries.is_empty(),
+            app.entries.is_empty(),
             "live entries should stay hidden until scan completion"
         );
     }
@@ -1831,7 +1827,7 @@ mod tests {
         assert_eq!(app.current_scan_dir, "/scan/cache");
 
         assert!(
-            app.flat_entries.is_empty(),
+            app.entries.is_empty(),
             "progress snapshots should not rebuild hidden scan rows"
         );
     }
@@ -1983,7 +1979,7 @@ mod tests {
     }
 
     #[test]
-    fn build_tree_snapshot_should_preserve_expanded_paths() {
+    fn build_tree_snapshot_should_nest_children_under_directories() {
         let path_children = HashMap::from([
             (
                 PathBuf::from("/scan"),
@@ -1999,26 +1995,21 @@ mod tests {
                 )],
             ),
         ]);
-        let mut app = App::new(Some(PathBuf::from("/scan")), false, AppConfig::default());
-        app.scan_status = ScanStatus::Scanning;
-        app.expanded_paths.insert(PathBuf::from("/scan/dir"));
+        let expanded_paths = std::collections::HashSet::new();
+        let deleted_paths = std::collections::HashSet::new();
 
-        app.entries = build_tree_snapshot(
-            &app.scan_path,
+        let entries = build_tree_snapshot(
+            &PathBuf::from("/scan"),
             &path_children,
-            &app.expanded_paths,
-            &app.deleted_paths,
+            &expanded_paths,
+            &deleted_paths,
         );
-        app.rebuild_flat_entries();
 
+        assert_eq!(entries.len(), 1, "root should have one directory child");
         assert_eq!(
-            app.flat_entries.len(),
-            2,
-            "expanded child should stay visible"
-        );
-        assert!(
-            app.flat_entries[0].expanded,
-            "directory should stay expanded"
+            entries[0].children.len(),
+            1,
+            "directory should have one nested child"
         );
     }
 
@@ -2033,20 +2024,19 @@ mod tests {
                 None,
             )],
         )]);
-        let mut app = App::new(Some(PathBuf::from("/scan")), false, AppConfig::default());
-        app.scan_status = ScanStatus::Scanning;
-        app.deleted_paths.insert(PathBuf::from("/scan/cache"));
+        let expanded_paths = std::collections::HashSet::new();
+        let mut deleted_paths = std::collections::HashSet::new();
+        deleted_paths.insert(PathBuf::from("/scan/cache"));
 
-        app.entries = build_tree_snapshot(
-            &app.scan_path,
+        let entries = build_tree_snapshot(
+            &PathBuf::from("/scan"),
             &path_children,
-            &app.expanded_paths,
-            &app.deleted_paths,
+            &expanded_paths,
+            &deleted_paths,
         );
-        app.rebuild_flat_entries();
 
         assert!(
-            app.flat_entries.is_empty(),
+            entries.is_empty(),
             "deleted item should stay hidden"
         );
     }
@@ -2111,11 +2101,11 @@ mod tests {
         fs::create_dir(&last_scan_path).expect("config path should be created");
         let config = AppConfig {
             ui: crate::config::UiConfig {
-                default_view: crate::app::View::BySize,
                 last_scan_path: Some(last_scan_path.clone()),
                 size_mode: SizeMode::Physical,
                 scan_profiles: Vec::new(),
                 last_selected_scan_profile: None,
+                ..crate::config::UiConfig::default()
             },
             ..AppConfig::default()
         };
@@ -2130,11 +2120,11 @@ mod tests {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let config = AppConfig {
             ui: crate::config::UiConfig {
-                default_view: crate::app::View::BySize,
                 last_scan_path: Some(tempdir.path().join("missing-dir")),
                 size_mode: SizeMode::Physical,
                 scan_profiles: Vec::new(),
                 last_selected_scan_profile: None,
+                ..crate::config::UiConfig::default()
             },
             ..AppConfig::default()
         };
@@ -2148,7 +2138,6 @@ mod tests {
     fn resolve_initial_scan_profile_should_ignore_saved_profile_for_explicit_cli_path() {
         let config = AppConfig {
             ui: crate::config::UiConfig {
-                default_view: crate::app::View::BySize,
                 last_scan_path: Some(PathBuf::from("/tmp/saved")),
                 size_mode: SizeMode::Physical,
                 scan_profiles: vec![ScanProfile {
@@ -2160,6 +2149,7 @@ mod tests {
                     display_filter: None,
                 }],
                 last_selected_scan_profile: Some("exclude-node-modules".to_string()),
+                ..crate::config::UiConfig::default()
             },
             ..AppConfig::default()
         };
@@ -2174,7 +2164,6 @@ mod tests {
     fn resolve_initial_scan_profile_should_use_saved_profile_for_persisted_scan_path() {
         let config = AppConfig {
             ui: crate::config::UiConfig {
-                default_view: crate::app::View::BySize,
                 last_scan_path: Some(PathBuf::from("/tmp/saved")),
                 size_mode: SizeMode::Physical,
                 scan_profiles: vec![ScanProfile {
@@ -2186,6 +2175,7 @@ mod tests {
                     display_filter: None,
                 }],
                 last_selected_scan_profile: Some("exclude-node-modules".to_string()),
+                ..crate::config::UiConfig::default()
             },
             ..AppConfig::default()
         };
@@ -2207,11 +2197,11 @@ mod tests {
     }
 
     #[test]
-    fn apply_startup_config_should_use_persisted_default_view() {
+    fn apply_startup_config_should_use_persisted_sort_key() {
         let mut app = App::new(None, false, AppConfig::default());
         let config = AppConfig {
             ui: crate::config::UiConfig {
-                default_view: crate::app::View::BySafety,
+                sort_key: crate::columns::SortKey::Safety,
                 last_scan_path: None,
                 size_mode: SizeMode::Physical,
                 scan_profiles: Vec::new(),
@@ -2222,7 +2212,7 @@ mod tests {
 
         apply_startup_config(&mut app, &config);
 
-        assert_eq!(app.current_view, crate::app::View::BySafety);
+        assert_eq!(app.columns.sort_key, crate::columns::SortKey::Safety);
     }
 
     #[test]
@@ -2788,7 +2778,7 @@ mod persist_settings_tests {
     use purifier_core::{Filter, FilterTest, ScanProfile, SizeMode};
 
     use super::persist_settings;
-    use crate::app::{App, AppModal, LlmStatus, SettingsDraft};
+    use crate::app::{App, LlmStatus, PreviewMode, SettingsDraft};
     use crate::config::AppConfig;
     use crate::secrets::{FakeSecretStore, SecretStore, SecretStoreError};
 
@@ -2989,7 +2979,7 @@ mod persist_settings_tests {
             true,
             AppConfig::default(),
         );
-        app.modal = Some(AppModal::Settings(draft.clone()));
+        app.preview_mode = PreviewMode::Settings(draft.clone());
 
         let mut classifier = Classifier::new(RulesEngine::new(&[]).unwrap(), None);
         let mut runtime_connection_rx = None;
@@ -3011,7 +3001,7 @@ mod persist_settings_tests {
         );
 
         assert!(result.is_err());
-        assert!(matches!(app.modal, Some(AppModal::Settings(_))));
+        assert!(matches!(app.preview_mode, PreviewMode::Settings(_)));
         assert_eq!(
             app.last_error.as_deref(),
             Some("Could not save settings: failed to write key for OpenRouter: boom")
@@ -3038,7 +3028,7 @@ mod persist_settings_tests {
             true,
             AppConfig::default(),
         );
-        app.modal = Some(AppModal::Settings(draft.clone()));
+        app.preview_mode = PreviewMode::Settings(draft.clone());
         app.llm_status = LlmStatus::Ready(ProviderKind::OpenRouter);
         app.llm_enabled = true;
         let mut secrets = FakeSecretStore::default();
@@ -3064,7 +3054,7 @@ mod persist_settings_tests {
         )
         .unwrap();
 
-        assert!(app.modal.is_none());
+        assert!(matches!(app.preview_mode, PreviewMode::Analytics));
         assert_eq!(app.preferences.llm.active_provider, ProviderKind::Anthropic);
         assert!(!app.llm_enabled);
         assert_eq!(app.llm_status, LlmStatus::Disabled);
@@ -3102,7 +3092,7 @@ mod persist_settings_tests {
             false,
             AppConfig::default(),
         );
-        app.modal = Some(AppModal::Settings(draft.clone()));
+        app.preview_mode = PreviewMode::Settings(draft.clone());
         let mut classifier = Classifier::new(RulesEngine::new(&[]).unwrap(), None);
         let mut secrets = FakeSecretStore::default();
         let mut runtime_connection_rx = None;
@@ -3125,7 +3115,7 @@ mod persist_settings_tests {
         )
         .unwrap();
 
-        assert!(matches!(app.modal, Some(AppModal::Settings(_))));
+        assert!(matches!(app.preview_mode, PreviewMode::Settings(_)));
         assert_eq!(
             app.preferences.llm.active_provider,
             ProviderKind::OpenRouter
@@ -3142,7 +3132,7 @@ mod persist_settings_tests {
             .recv_timeout(std::time::Duration::from_secs(1))
             .expect("validation result should arrive");
         super::apply_runtime_connection_event(&mut app, &mut classifier, event);
-        assert!(app.modal.is_none());
+        assert!(matches!(app.preview_mode, PreviewMode::Analytics));
         assert_eq!(app.llm_status, LlmStatus::Ready(ProviderKind::OpenRouter));
         assert!(classifier.has_llm());
     }
@@ -3171,7 +3161,7 @@ mod persist_settings_tests {
             false,
             AppConfig::default(),
         );
-        app.modal = Some(AppModal::Settings(draft.clone()));
+        app.preview_mode = PreviewMode::Settings(draft.clone());
         let mut classifier = Classifier::new(RulesEngine::new(&[]).unwrap(), None);
         let mut secrets = FakeSecretStore::default();
         let mut runtime_connection_rx = None;
@@ -3194,7 +3184,7 @@ mod persist_settings_tests {
         )
         .unwrap();
 
-        assert!(matches!(app.modal, Some(AppModal::Settings(_))));
+        assert!(matches!(app.preview_mode, PreviewMode::Settings(_)));
         assert!(app.llm_enabled);
         assert_eq!(
             app.llm_status,
@@ -3218,7 +3208,7 @@ mod persist_settings_tests {
                 "OpenRouter connection failed: HTTP 401 Unauthorized - Invalid API key. Update the API key or provider and save again."
             )
         );
-        assert!(matches!(app.modal, Some(AppModal::Settings(_))));
+        assert!(matches!(app.preview_mode, PreviewMode::Settings(_)));
     }
 
     #[test]
@@ -3245,7 +3235,7 @@ mod persist_settings_tests {
             false,
             AppConfig::default(),
         );
-        app.modal = Some(AppModal::Settings(draft.clone()));
+        app.preview_mode = PreviewMode::Settings(draft.clone());
         let mut classifier = Classifier::new(RulesEngine::new(&[]).unwrap(), None);
         let mut secrets = FakeSecretStore::default();
         let mut runtime_connection_rx = None;
@@ -3268,7 +3258,7 @@ mod persist_settings_tests {
         )
         .unwrap();
 
-        assert!(matches!(app.modal, Some(AppModal::Settings(_))));
+        assert!(matches!(app.preview_mode, PreviewMode::Settings(_)));
         assert!(app.llm_enabled);
         assert_eq!(
             app.llm_status,
@@ -3282,7 +3272,7 @@ mod persist_settings_tests {
             .recv_timeout(std::time::Duration::from_secs(1))
             .expect("validation result should arrive");
         super::apply_runtime_connection_event(&mut app, &mut classifier, event);
-        assert!(app.modal.is_none());
+        assert!(matches!(app.preview_mode, PreviewMode::Analytics));
         assert_eq!(app.llm_status, LlmStatus::Ready(ProviderKind::OpenRouter));
         assert!(app.llm_online);
         assert!(classifier.has_llm());
@@ -3309,7 +3299,7 @@ mod persist_settings_tests {
             false,
             AppConfig::default(),
         );
-        app.modal = Some(AppModal::Settings(draft.clone()));
+        app.preview_mode = PreviewMode::Settings(draft.clone());
         let mut classifier = Classifier::new(RulesEngine::new(&[]).unwrap(), None);
         let mut secrets = FakeSecretStore::default();
         let mut runtime_connection_rx = None;
@@ -3365,7 +3355,7 @@ mod persist_settings_tests {
             false,
             AppConfig::default(),
         );
-        app.modal = Some(AppModal::Settings(draft.clone()));
+        app.preview_mode = PreviewMode::Settings(draft.clone());
         let mut classifier = Classifier::new(RulesEngine::new(&[]).unwrap(), None);
         let mut secrets = FakeSecretStore::default();
         let mut runtime_connection_rx = None;
@@ -3389,7 +3379,7 @@ mod persist_settings_tests {
         )
         .unwrap();
 
-        assert!(app.modal.is_none());
+        assert!(matches!(app.preview_mode, PreviewMode::Analytics));
         assert!(!app.settings_modal_is_saving);
         assert!(app.pending_settings_validation_generation.is_none());
         assert_eq!(app.llm_status, LlmStatus::Connecting(ProviderKind::OpenAI));
@@ -3422,7 +3412,7 @@ mod persist_settings_tests {
             false,
             AppConfig::default(),
         );
-        app.modal = Some(AppModal::Settings(draft.clone()));
+        app.preview_mode = PreviewMode::Settings(draft.clone());
         let mut classifier = Classifier::new(RulesEngine::new(&[]).unwrap(), None);
         let mut secrets = FakeSecretStore::default();
         let mut runtime_connection_rx = None;
@@ -3449,7 +3439,7 @@ mod persist_settings_tests {
         )
         .unwrap();
 
-        assert!(app.modal.is_none());
+        assert!(matches!(app.preview_mode, PreviewMode::Analytics));
         assert!(!app.settings_modal_is_saving);
         assert!(app.pending_settings_validation_generation.is_none());
         assert_eq!(

@@ -55,34 +55,52 @@ purifier --provider openai --api-key YOUR_KEY
 
 ## Keybindings
 
+### Navigation (Miller Columns)
+
 | Key | Action |
 |-----|--------|
-| `1` / `2` / `3` / `4` | Switch view: Size / Type / Safety / Age |
-| `j` / `k` or `Down` / `Up` | Navigate entries |
-| `Enter` / `l` / `Right` | Expand directory |
-| `h` / `Left` | Collapse directory |
-| `d` | Delete selected item (with confirmation) |
+| `j` / `k` or `Down` / `Up` | Move within current column |
+| `l` / `Right` / `Enter` | Enter directory (step into) |
+| `h` / `Left` | Go back to parent |
+| `g` / `G` | Jump to top / bottom of column |
+| `~` | Navigate to home directory |
+| `s` | Cycle sort: Size → Safety → Age → Name |
+| `i` | Toggle size mode: Physical ↔ Logical |
+
+### Deletion
+
+| Key | Action |
+|-----|--------|
+| `d` | Quick delete selected item (confirm in preview pane) |
+| `Space` | Mark / unmark item for batch deletion |
+| `x` | Review and execute all marked deletions |
+| `u` | Clear all marks |
 | `y` / `n` | Confirm / cancel deletion |
-| `q` / `Esc` | Quit |
 
-Inside the settings modal:
+### Other
 
-- `m` toggles between `Physical` and `Logical` size mode
-- `p` cycles the saved scan profile
+| Key | Action |
+|-----|--------|
+| `,` | Open settings (in preview pane) |
+| `q` / `Esc` | Quit (or cancel current modal) |
 
-## Views
+Inside settings (preview pane):
 
-### Tab 1: By Size (default)
-Directory tree sorted by the currently selected size mode, largest first. Each entry shows a proportional size bar and a colored safety badge.
+- `1`-`4` selects LLM provider
+- `a` edits API key
+- `m` toggles size mode
+- `p` cycles scan profile
+- `Enter` saves, `Esc` cancels
 
-### Tab 2: By Type
-Entries grouped by category: Build Artifacts, Caches, Downloads, App Data, Media, System, Unknown.
+## Navigation
 
-### Tab 3: By Safety
-The "suggested cleanup" view. Groups entries into Safe (green), Caution (yellow), Unsafe (red), and Unknown (gray).
+Purifier uses a **Miller Columns** layout (like macOS Finder in column view):
 
-### Tab 4: By Age
-Sorted by last modified date. Highlights old files you may have forgotten about.
+- **Left pane** — parent directory
+- **Center pane** — current directory (sorted by the active sort key)
+- **Right pane** — preview: safety verdict, type/age breakdowns, and size analytics for the selected item
+
+This design eliminates the tree-rebuild performance bottleneck — each interaction renders a single directory listing, not the entire tree. Navigation into a directory with 100,000 children is as fast as one with 10.
 
 ## Safety classification
 
@@ -173,14 +191,28 @@ Custom rules are evaluated **before** the defaults, so they take priority.
 purifier/
 ├── crates/
 │   ├── purifier-core/       # library: scanner, filters, size model, classifier, LLM client
-│   └── purifier-tui/        # binary: Ratatui frontend, config, event loop
+│   └── purifier-tui/        # binary: Miller Columns TUI, config, event loop
+│       └── src/
+│           ├── app.rs        # App state, column stack, marks, preview modes
+│           ├── columns.rs    # ColumnStack, SortKey, sorted_children
+│           ├── marks.rs      # MarkSet for batch deletion
+│           ├── input.rs      # Keyboard/mouse handling
+│           ├── config.rs     # Persistent config (sort key, size mode, profiles)
+│           ├── secrets.rs    # Keychain integration
+│           └── ui/
+│               ├── mod.rs          # Miller layout + scanning overlay
+│               ├── columns_view.rs # Three-pane column rendering
+│               ├── preview_pane.rs # Analytics, delete confirm, settings
+│               ├── status_bar.rs   # Breadcrumb, marks, sort/LLM status
+│               ├── onboarding.rs   # First-launch setup screen
+│               └── dir_picker.rs   # Directory selection screen
 └── rules/
     └── default.toml         # built-in macOS safety rules
 ```
 
 Two-crate workspace:
 - **purifier-core** — all logic with no terminal dependency. Testable in isolation.
-- **purifier-tui** — thin Ratatui shell that renders state and handles input.
+- **purifier-tui** — Miller Columns TUI built with Ratatui. Column-stack navigation model with zero tree rebuilds.
 
 ### Key dependencies
 

@@ -2,23 +2,23 @@
 
 ## Current Snapshot
 
-Purifier is a macOS terminal disk cleanup tool built in Rust. It scans the filesystem, groups entries by size/type/safety/age, and explains whether a path is safe to delete.
+Purifier is a macOS terminal disk cleanup tool built in Rust. It scans the filesystem, navigates directories via Miller Columns, and explains whether a path is safe to delete.
 
-Current state in this branch/worktree:
+Current state:
 
-- Core scanning, rules, deletion flow, scan profiles, and TUI views are implemented.
+- Core scanning, rules, deletion flow, scan profiles, and Miller Columns TUI are implemented.
 - Unknown paths can be sent to an optional LLM classifier.
 - Live runtime-wired providers are `OpenRouter` and `OpenAI`.
 - `Anthropic` and `Google` settings can be persisted, but runtime support is not wired yet.
 - `Ollama` is intentionally disabled for now. The code keeps TODO markers for restoring it later.
 - User preferences are persisted in `~/.config/purifier/config.toml`.
 - Provider secrets are stored in macOS Keychain.
-- The TUI has first-launch onboarding and a settings modal.
+- The TUI has first-launch onboarding and settings in the preview pane.
 - Size mode is persisted and defaults to `Physical`.
 - Built-in scan profiles are available by default: `Full scan`, `Fast developer scan`.
-- Blocking scans use a responsive hidden-tree progress flow and can overlap hidden LLM batching.
+- Blocking scans use a responsive progress overlay; columns populate after scan completes.
 - Physical totals are hard-link-aware and use allocated-block accounting on Unix/macOS.
-- This worktree currently passes:
+- This branch passes:
   - `cargo test -p purifier-core`
   - `cargo test -p purifier-tui`
   - `cargo clippy -p purifier-core -p purifier-tui --all-targets -- -D warnings`
@@ -36,9 +36,12 @@ Purifier is a two-crate workspace:
   - runtime LLM clients and batching helpers
 - `crates/purifier-tui`
   - CLI parsing and startup resolution
-  - persisted app/config state
-  - size-mode and scan-profile selection
-  - modal/input handling
+  - **Miller Columns** navigation model (ColumnStack, SortKey)
+  - Mark set for batch deletion
+  - Preview pane with analytics, delete confirm, batch review, settings
+  - Persisted app/config state (sort key, size mode, scan profile)
+  - Standalone onboarding screen
+  - Status bar with breadcrumb, marks, sort/scan/LLM status
   - Ratatui rendering
 
 Important current files:
@@ -51,10 +54,15 @@ Important current files:
 - `crates/purifier-core/src/scanner.rs`
 - `crates/purifier-tui/src/main.rs`
 - `crates/purifier-tui/src/app.rs`
+- `crates/purifier-tui/src/columns.rs`
+- `crates/purifier-tui/src/marks.rs`
 - `crates/purifier-tui/src/input.rs`
 - `crates/purifier-tui/src/config.rs`
 - `crates/purifier-tui/src/secrets.rs`
-- `crates/purifier-tui/src/ui/settings_modal.rs`
+- `crates/purifier-tui/src/ui/columns_view.rs`
+- `crates/purifier-tui/src/ui/preview_pane.rs`
+- `crates/purifier-tui/src/ui/status_bar.rs`
+- `crates/purifier-tui/src/ui/onboarding.rs`
 
 ## Provider Status
 
@@ -74,21 +82,19 @@ Important current files:
 - Hard-link-aware physical totals
 - Rule-based classification for common macOS cleanup paths
 - LLM fallback batching for unknown entries
-- Responsive blocking scan progress with hidden tree until completion
+- Responsive blocking scan progress with overlay until completion
 - Background scan processing with coalesced progress snapshots
 - Scan profiles with scan-time exclusion
 - Built-in profiles: `Full scan`, `Fast developer scan`
-- Size/Type/Safety/Age views
+- **Miller Columns navigation** (parent | current | preview)
+- **Sort cycling** within columns (Size → Safety → Age → Name)
+- **Rich preview pane** with type/age/safety breakdowns for directories, file details for files
+- **Quick delete** (d → confirm in preview) and **batch mark-and-sweep** (Space → x → confirm)
+- Settings rendered in preview pane, available anytime (not gated on scan completion)
+- Standalone onboarding screen for first launch
+- Status bar with breadcrumb, mark count, sort mode, scan/LLM status
 - Safe delete confirmation flow with logical remove size plus estimated/observed physical freed-space reporting
-- Persistent default view and last scan path
-- First-launch onboarding modal
-- Settings modal with:
-  - provider switching for currently exposed providers
-  - API-key editing
-  - size-mode toggle
-  - scan-profile selection
-  - safe persistence to config + Keychain
-  - live runtime refresh after successful save
+- Persistent sort key and last scan path
 - In-app warning vs error messaging
 
 ## Accepted Current Behavior
@@ -102,7 +108,7 @@ Important current files:
 - `Ollama` is disabled for now.
 - APFS clone/shared-block accounting is still best-effort; physical totals do not compute exact unique clone ownership.
 - Excluded directories are currently omitted from results and totals, but scanner traversal is not yet pruned at the walker level.
-- The settings modal currently treats `model` and `base_url` as provider-derived, read-only values.
+- The settings form currently treats `model` and `base_url` as provider-derived, read-only values.
 - Provider runtime refresh is intentionally conservative and follows launch-time CLI/env precedence.
 
 ## Next Work

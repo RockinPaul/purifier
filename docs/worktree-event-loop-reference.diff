@@ -1,0 +1,642 @@
+diff --git a/crates/purifier-tui/src/main.rs b/crates/purifier-tui/src/main.rs
+index 7626c40..080cf06 100644
+--- a/crates/purifier-tui/src/main.rs
++++ b/crates/purifier-tui/src/main.rs
+@@ -36,7 +36,7 @@ use secrets::{KeychainSecretStore, SecretStore};
+ 
+ /// Max scan events to process per frame to prevent input starvation
+ #[cfg_attr(not(test), allow(dead_code))]
+-const MAX_EVENTS_PER_FRAME: usize = 1000;
++const MAX_EVENTS_PER_FRAME: usize = 128;
+ #[cfg_attr(not(test), allow(dead_code))]
+ const LLM_BATCH_SIZE: usize = 50;
+ 
+@@ -264,21 +264,57 @@ fn run_loop(
+     secrets: &mut impl SecretStore,
+     session: SessionContext<'_>,
+ ) -> io::Result<()> {
++    const MAX_READY_EVENTS_PER_FRAME: usize = 32;
++    const MAX_LLM_RESULT_BATCHES_PER_FRAME: usize = 8;
++    const MAX_BUFFERED_LLM_RESULTS_PER_FRAME: usize = 200;
++
+     let (mut unknown_tx, mut llm_result_rx) = start_llm_processing(classifier, app);
+     let mut buffered_unknown_batches: Vec<Vec<UnknownEntry>> = Vec::new();
+     let mut buffered_llm_results: Vec<LlmClassification> = Vec::new();
+ 
+     loop {
+-        terminal.draw(|frame| ui::draw(frame, app))?;
++        let _ = drain_ready_events(
++            MAX_READY_EVENTS_PER_FRAME,
++            || event::poll(Duration::ZERO),
++            event::read,
++            |event| {
++                handle_terminal_event(
++                    terminal,
++                    app,
++                    classifier,
++                    scan_rx,
++                    runtime_connection_rx,
++                    config_path,
++                    secrets,
++                    session,
++                    &mut unknown_tx,
++                    &mut llm_result_rx,
++                    &mut buffered_unknown_batches,
++                    &mut buffered_llm_results,
++                    event,
++                )
++            },
++        )?;
++
++        if app.should_quit {
++            if let Some(active_scan) = scan_rx.take() {
++                let _ = active_scan.cancel.send(());
++            }
++            return Ok(());
++        }
+ 
+         // Process scan updates — capped per frame to keep input responsive.
+         let mut scan_completed = false;
++        let mut latest_progress = None;
+         if let Some(rx) = scan_rx.as_ref() {
+             let mut processed = 0;
+             while processed < MAX_EVENTS_PER_FRAME {
+                 match rx.updates.try_recv() {
+                     Ok(event) => {
+                         match event {
++                            ScanProcessingUpdate::Progress(progress) => {
++                                latest_progress = Some(progress);
++                            }
+                             ScanProcessingUpdate::UnknownBatch(batch) => {
+                                 if let Some(tx) = unknown_tx.as_ref() {
+                                     let _ = tx.send(batch);
+@@ -288,12 +324,6 @@ fn run_loop(
+                             }
+                             other => {
+                                 if apply_scan_update(app, other) {
+-                                    if !buffered_llm_results.is_empty() {
+-                                        apply_llm_results(
+-                                            app,
+-                                            std::mem::take(&mut buffered_llm_results),
+-                                        );
+-                                    }
+                                     if unknown_tx.is_none() && !should_mark_unknowns_pending(app) {
+                                         buffered_unknown_batches.clear();
+                                         reset_pending_llm_labels_in_state(app);
+@@ -311,17 +341,22 @@ fn run_loop(
+ 
+         if scan_completed {
+             *scan_rx = None;
++        } else if let Some(progress) = latest_progress {
++            let _ = apply_scan_update(app, ScanProcessingUpdate::Progress(progress));
+         }
+ 
+-        if let Some(result_rx) = llm_result_rx.as_ref() {
+-            while let Ok(results) = result_rx.try_recv() {
+-                if app.scan_status == ScanStatus::Scanning && app.entries.is_empty() {
+-                    buffered_llm_results.extend(results);
+-                } else {
+-                    apply_llm_results(app, results);
+-                }
+-            }
+-        }
++        drain_buffered_llm_results(
++            app,
++            &mut buffered_llm_results,
++            MAX_BUFFERED_LLM_RESULTS_PER_FRAME,
++        );
++
++        drain_llm_result_batches(
++            app,
++            llm_result_rx.as_ref(),
++            &mut buffered_llm_results,
++            MAX_LLM_RESULT_BATCHES_PER_FRAME,
++        );
+ 
+         let connection_event = runtime_connection_rx
+             .as_ref()
+@@ -339,94 +374,190 @@ fn run_loop(
+             }
+         }
+ 
+-        // Handle input — always polled every frame
++        terminal.draw(|frame| ui::draw(frame, app))?;
++
+         if event::poll(Duration::from_millis(50))? {
+-            match event::read()? {
+-                Event::Key(key) => {
+-                    match input::handle_key(app, key) {
+-                        InputResult::StartScan(path) => {
+-                            // User selected a directory from picker — start scanning
+-                            let path = normalize_scan_path(&path);
+-                            app.scan_path = path.clone();
+-                            let scan_profile = app.preferences.active_scan_profile().cloned();
+-                            app.applied_scan_profile_name =
+-                                scan_profile.as_ref().map(|profile| profile.name.clone());
+-                            if let Some(active_scan) = scan_rx.take() {
+-                                let _ = active_scan.cancel.send(());
+-                            }
+-                            *scan_rx = Some(start_scan_processing(
+-                                path.clone(),
+-                                scanner::scan_with_profile(&path, scan_profile),
+-                                classifier_rules(classifier),
+-                                should_mark_unknowns_pending(app),
+-                            ));
+-                            restart_llm_processing_for_new_scan(
+-                                classifier,
+-                                app,
+-                                &mut unknown_tx,
+-                                &mut llm_result_rx,
+-                                &mut buffered_unknown_batches,
+-                                &mut buffered_llm_results,
+-                            );
+-                        }
+-                        InputResult::SaveSettings(draft) => {
+-                            if apply_settings_save(
+-                                app,
+-                                config_path,
+-                                draft,
+-                                secrets,
+-                                classifier,
+-                                runtime_connection_rx,
+-                                session.cli,
+-                                session.env,
+-                            )
+-                            .is_ok()
+-                            {
+-                                (unknown_tx, llm_result_rx) = start_llm_processing(classifier, app);
+-                                if unknown_tx.is_some() {
+-                                    flush_unknown_batches(
+-                                        &mut buffered_unknown_batches,
+-                                        unknown_tx.as_ref(),
+-                                    );
+-                                    requeue_unknown_entries_for_visible_tree(
+-                                        app,
+-                                        unknown_tx.as_ref(),
+-                                    );
+-                                } else {
+-                                    reset_pending_llm_labels_in_state(app);
+-                                }
+-                            }
+-                        }
+-                        InputResult::SkipOnboarding => {
+-                            let _ = apply_onboarding_skip(
+-                                app,
+-                                config_path,
+-                                secrets,
+-                                classifier,
+-                                runtime_connection_rx,
+-                                session.cli,
+-                                session.env,
+-                            );
+-                        }
+-                        InputResult::None => {}
+-                    }
+-                    if app.should_quit {
+-                        if let Some(active_scan) = scan_rx.take() {
+-                            let _ = active_scan.cancel.send(());
+-                        }
+-                        return Ok(());
+-                    }
++            handle_terminal_event(
++                terminal,
++                app,
++                classifier,
++                scan_rx,
++                runtime_connection_rx,
++                config_path,
++                secrets,
++                session,
++                &mut unknown_tx,
++                &mut llm_result_rx,
++                &mut buffered_unknown_batches,
++                &mut buffered_llm_results,
++                event::read()?,
++            )?;
++        }
++
++        if app.should_quit {
++            if let Some(active_scan) = scan_rx.take() {
++                let _ = active_scan.cancel.send(());
++            }
++            return Ok(());
++        }
++    }
++}
++
++fn drain_buffered_llm_results(
++    app: &mut App,
++    buffered_llm_results: &mut Vec<LlmClassification>,
++    max_results: usize,
++) {
++    if buffered_llm_results.is_empty()
++        || app.scan_status == ScanStatus::Scanning
++        || app.entries.is_empty()
++    {
++        return;
++    }
++
++    let drain_count = buffered_llm_results.len().min(max_results);
++    let results = buffered_llm_results
++        .drain(..drain_count)
++        .collect::<Vec<_>>();
++    apply_llm_results(app, results);
++}
++
++fn drain_llm_result_batches(
++    app: &mut App,
++    result_rx: Option<&LlmResultReceiver>,
++    buffered_llm_results: &mut Vec<LlmClassification>,
++    max_batches: usize,
++) {
++    let Some(result_rx) = result_rx else {
++        return;
++    };
++
++    let mut processed = 0;
++    while processed < max_batches {
++        match result_rx.try_recv() {
++            Ok(results) => {
++                if app.scan_status == ScanStatus::Scanning && app.entries.is_empty() {
++                    buffered_llm_results.extend(results);
++                } else {
++                    apply_llm_results(app, results);
+                 }
+-                Event::Mouse(mouse) => {
+-                    let size = terminal.size()?;
+-                    let layout =
+-                        ui::main_layout(ratatui::layout::Rect::new(0, 0, size.width, size.height));
+-                    input::handle_mouse(app, mouse, layout);
++                processed += 1;
++            }
++            Err(_) => break,
++        }
++    }
++}
++
++fn drain_ready_events<P, R, H>(
++    max_events: usize,
++    mut poll: P,
++    mut read: R,
++    mut handle: H,
++) -> io::Result<bool>
++where
++    P: FnMut() -> io::Result<bool>,
++    R: FnMut() -> io::Result<Event>,
++    H: FnMut(Event) -> io::Result<()>,
++{
++    let mut handled_any = false;
++    let mut remaining = max_events;
++    while remaining > 0 && poll()? {
++        handle(read()?)?;
++        handled_any = true;
++        remaining -= 1;
++    }
++    Ok(handled_any)
++}
++
++#[expect(
++    clippy::too_many_arguments,
++    reason = "Terminal events can trigger scans, settings persistence, and runtime refreshes"
++)]
++fn handle_terminal_event(
++    terminal: &Terminal<CrosstermBackend<io::Stdout>>,
++    app: &mut App,
++    classifier: &mut Classifier,
++    scan_rx: &mut Option<ActiveScan>,
++    runtime_connection_rx: &mut Option<RuntimeConnectionReceiver>,
++    config_path: &Path,
++    secrets: &mut impl SecretStore,
++    session: SessionContext<'_>,
++    unknown_tx: &mut Option<UnknownBatchSender>,
++    llm_result_rx: &mut Option<LlmResultReceiver>,
++    buffered_unknown_batches: &mut Vec<Vec<UnknownEntry>>,
++    buffered_llm_results: &mut Vec<LlmClassification>,
++    event: Event,
++) -> io::Result<()> {
++    match event {
++        Event::Key(key) => match input::handle_key(app, key) {
++            InputResult::StartScan(path) => {
++                let path = normalize_scan_path(&path);
++                app.scan_path = path.clone();
++                let scan_profile = app.preferences.active_scan_profile().cloned();
++                app.applied_scan_profile_name =
++                    scan_profile.as_ref().map(|profile| profile.name.clone());
++                if let Some(active_scan) = scan_rx.take() {
++                    let _ = active_scan.cancel.send(());
++                }
++                *scan_rx = Some(start_scan_processing(
++                    path.clone(),
++                    scanner::scan_with_profile(&path, scan_profile),
++                    classifier_rules(classifier),
++                    should_mark_unknowns_pending(app),
++                ));
++                restart_llm_processing_for_new_scan(
++                    classifier,
++                    app,
++                    unknown_tx,
++                    llm_result_rx,
++                    buffered_unknown_batches,
++                    buffered_llm_results,
++                );
++            }
++            InputResult::SaveSettings(draft) => {
++                if apply_settings_save(
++                    app,
++                    config_path,
++                    draft,
++                    secrets,
++                    classifier,
++                    runtime_connection_rx,
++                    session.cli,
++                    session.env,
++                )
++                .is_ok()
++                {
++                    (*unknown_tx, *llm_result_rx) = start_llm_processing(classifier, app);
++                    if unknown_tx.is_some() {
++                        flush_unknown_batches(buffered_unknown_batches, unknown_tx.as_ref());
++                        requeue_unknown_entries_for_visible_tree(app, unknown_tx.as_ref());
++                    } else {
++                        reset_pending_llm_labels_in_state(app);
++                    }
+                 }
+-                _ => {}
+             }
++            InputResult::SkipOnboarding => {
++                let _ = apply_onboarding_skip(
++                    app,
++                    config_path,
++                    secrets,
++                    classifier,
++                    runtime_connection_rx,
++                    session.cli,
++                    session.env,
++                );
++            }
++            InputResult::None => {}
++        },
++        Event::Mouse(mouse) => {
++            let size = terminal.size()?;
++            let layout = ui::main_layout(ratatui::layout::Rect::new(0, 0, size.width, size.height));
++            input::handle_mouse(app, mouse, layout);
+         }
++        _ => {}
+     }
++
++    Ok(())
+ }
+ 
+ #[expect(
+@@ -1498,27 +1629,31 @@ fn find_default_rules() -> Option<PathBuf> {
+ 
+ #[cfg(test)]
+ mod tests {
+-    use std::collections::HashMap;
+-    use std::fs;
+-    use std::io::{Read, Write};
+-    use std::net::TcpListener;
+-    use std::path::PathBuf;
+-
+     use crate::{Cli, EnvOverrides};
++    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+     use purifier_core::llm::{LlmClassification, OpenRouterClient, UnknownEntry};
+     use purifier_core::provider::{LlmClient, ProviderKind, ResolvedProviderConfig};
+     use purifier_core::rules::RulesEngine;
+     use purifier_core::size::SizeMode;
+     use purifier_core::types::{Category, FileEntry, SafetyLevel, ScanEvent};
++    use std::cell::RefCell;
++    use std::collections::HashMap;
++    use std::collections::VecDeque;
++    use std::fs;
++    use std::io::{Read, Write};
++    use std::net::TcpListener;
++    use std::path::PathBuf;
+ 
+     use super::{
+         apply_llm_results, apply_runtime_config, apply_runtime_connection_event, apply_scan_update,
+         apply_startup_config, apply_startup_messages, build_tree, build_tree_snapshot,
+-        load_app_config, normalize_scan_path, queue_unknown_entry, refresh_scan_snapshot,
++        drain_buffered_llm_results, drain_llm_result_batches, drain_ready_events, load_app_config,
++        normalize_scan_path, queue_unknown_entry, refresh_scan_snapshot,
+         requeue_unknown_entries_for_visible_tree, reset_pending_llm_labels,
+         reset_pending_llm_labels_in_state, resolve_initial_scan_path, resolve_initial_scan_profile,
+         restart_llm_processing_for_new_scan, start_llm_processing, start_runtime_connection_check,
+-        start_scan_processing, RuntimeConfig, ScanProcessingUpdate, ScanProgressSnapshot,
++        start_scan_processing, CompletedScanResult, RuntimeConfig, ScanProcessingUpdate,
++        ScanProgressSnapshot,
+     };
+     use crate::app::{App, LlmStatus, ScanStatus};
+     use crate::config::AppConfig;
+@@ -1581,6 +1716,199 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn drain_ready_events_should_process_queued_input_before_draw_phase() {
++        let mut app = App::new(Some(PathBuf::from("/")), false, AppConfig::default());
++        app.entries = vec![
++            FileEntry::new(PathBuf::from("/a"), 3, false, None),
++            FileEntry::new(PathBuf::from("/b"), 2, false, None),
++        ];
++        app.rebuild_flat_entries();
++
++        let events = RefCell::new(VecDeque::from([Event::Key(KeyEvent::new(
++            KeyCode::Down,
++            KeyModifiers::NONE,
++        ))]));
++
++        let handled_any = drain_ready_events(
++            8,
++            || Ok(!events.borrow().is_empty()),
++            || {
++                Ok(events
++                    .borrow_mut()
++                    .pop_front()
++                    .expect("queued event should be readable"))
++            },
++            |event| {
++                if let Event::Key(key) = event {
++                    crate::input::handle_key(&mut app, key);
++                }
++                Ok(())
++            },
++        )
++        .expect("draining pending input should succeed");
++
++        assert!(handled_any, "queued input should be drained before draw");
++        assert_eq!(app.selected_index, 1);
++    }
++
++    #[test]
++    fn drain_ready_events_should_stop_after_configured_limit() {
++        let events = RefCell::new(VecDeque::from(vec![
++            Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
++            Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
++            Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
++        ]));
++        let handled = RefCell::new(0_usize);
++
++        let handled_any = drain_ready_events(
++            2,
++            || Ok(!events.borrow().is_empty()),
++            || {
++                Ok(events
++                    .borrow_mut()
++                    .pop_front()
++                    .expect("queued event should be readable"))
++            },
++            |_| {
++                *handled.borrow_mut() += 1;
++                Ok(())
++            },
++        )
++        .expect("draining pending input should succeed");
++
++        assert!(handled_any);
++        assert_eq!(*handled.borrow(), 2);
++        assert_eq!(events.borrow().len(), 1);
++    }
++
++    #[test]
++    fn drain_llm_result_batches_should_stop_after_configured_limit() {
++        let mut app = App::new(Some(PathBuf::from("/")), false, AppConfig::default());
++        app.entries = vec![FileEntry::new(PathBuf::from("/a"), 1, false, None)];
++        app.rebuild_flat_entries();
++        let (tx, rx) = crossbeam_channel::unbounded();
++
++        for path in ["/one", "/two", "/three"] {
++            tx.send(vec![LlmClassification {
++                path: PathBuf::from(path),
++                category: Category::Unknown,
++                safety: SafetyLevel::Unknown,
++                reason: "noop".to_string(),
++            }])
++            .expect("batch should send");
++        }
++
++        let mut buffered = Vec::new();
++        drain_llm_result_batches(&mut app, Some(&rx), &mut buffered, 2);
++
++        assert!(rx.try_recv().is_ok(), "one batch should remain queued");
++    }
++
++    #[test]
++    fn drain_buffered_llm_results_should_apply_only_configured_prefix() {
++        let mut first = FileEntry::new(PathBuf::from("/one"), 1, false, None);
++        first.category = Category::Unknown;
++        let mut second = FileEntry::new(PathBuf::from("/two"), 1, false, None);
++        second.category = Category::Unknown;
++        let mut app = App::new(Some(PathBuf::from("/")), false, AppConfig::default());
++        app.entries = vec![first, second];
++        app.scan_status = ScanStatus::Complete;
++        app.switch_view(crate::app::View::ByType);
++
++        let mut buffered = vec![
++            LlmClassification {
++                path: PathBuf::from("/one"),
++                category: Category::BuildArtifact,
++                safety: SafetyLevel::Unknown,
++                reason: "first".to_string(),
++            },
++            LlmClassification {
++                path: PathBuf::from("/two"),
++                category: Category::Cache,
++                safety: SafetyLevel::Unknown,
++                reason: "second".to_string(),
++            },
++        ];
++
++        drain_buffered_llm_results(&mut app, &mut buffered, 1);
++
++        assert_eq!(buffered.len(), 1);
++        assert!(matches!(
++            app.entries.iter().find(|entry| entry.path == std::path::Path::new("/one")),
++            Some(entry) if entry.category == Category::BuildArtifact
++        ));
++        assert!(matches!(
++            app.entries.iter().find(|entry| entry.path == std::path::Path::new("/two")),
++            Some(entry) if entry.category == Category::Unknown
++        ));
++    }
++
++    #[test]
++    fn complete_scan_should_not_be_overwritten_by_older_progress_snapshot() {
++        let mut app = App::new(Some(PathBuf::from("/scan")), false, AppConfig::default());
++        let _ = apply_scan_update(
++            &mut app,
++            ScanProcessingUpdate::Complete(CompletedScanResult {
++                entries: vec![],
++                total_entries: 42,
++                total_logical_bytes: 100,
++                total_physical_bytes: 200,
++                skipped: 0,
++            }),
++        );
++
++        let scan_completed = true;
++        let latest_progress = Some(ScanProgressSnapshot {
++            entries_scanned: 10,
++            logical_bytes_found: 50,
++            physical_bytes_found: 60,
++            current_path: "/stale".to_string(),
++        });
++
++        if scan_completed {
++            // intentionally skip stale progress after completion
++        } else if let Some(progress) = latest_progress {
++            let _ = apply_scan_update(&mut app, ScanProcessingUpdate::Progress(progress));
++        }
++
++        assert_eq!(app.total_files, 42);
++        assert_eq!(app.total_logical_size, 100);
++        assert_eq!(app.total_physical_size, 200);
++    }
++
++    #[test]
++    fn apply_llm_results_should_preserve_grouped_selection_identity() {
++        let mut first = FileEntry::new(PathBuf::from("/first"), 10, false, None);
++        first.category = Category::BuildArtifact;
++        let mut second = FileEntry::new(PathBuf::from("/second"), 5, false, None);
++        second.category = Category::Cache;
++
++        let mut app = App::new(Some(PathBuf::from("/")), false, AppConfig::default());
++        app.entries = vec![first, second];
++        app.switch_view(crate::app::View::ByType);
++        app.selected_index = app
++            .flat_entries
++            .iter()
++            .position(|row| matches!(row, crate::app::FlatRow::Entry(entry) if entry.path == std::path::Path::new("/second")))
++            .expect("selected entry should exist");
++
++        apply_llm_results(
++            &mut app,
++            vec![LlmClassification {
++                path: PathBuf::from("/second"),
++                category: Category::AppData,
++                safety: SafetyLevel::Unknown,
++                reason: "moved".to_string(),
++            }],
++        );
++
++        assert!(matches!(
++            app.selected_row(),
++            Some(crate::app::FlatRow::Entry(entry)) if entry.path == std::path::Path::new("/second")
++        ));
++    }
++
+     #[test]
+     fn restart_llm_processing_for_new_scan_should_replace_old_result_receiver() {
+         let classifier = Classifier::new(
+@@ -2017,7 +2345,10 @@ mod tests {
+             "expanded child should stay visible"
+         );
+         assert!(
+-            app.flat_entries[0].expanded,
++            matches!(
++                app.flat_entries.first(),
++                Some(crate::app::FlatRow::Entry(entry)) if entry.expanded
++            ),
+             "directory should stay expanded"
+         );
+     }

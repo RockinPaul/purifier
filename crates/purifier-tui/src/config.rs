@@ -8,7 +8,7 @@ use purifier_core::ScanProfile;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::app::View;
+use crate::columns::SortKey;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -51,7 +51,7 @@ pub struct AppConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiConfig {
-    pub default_view: View,
+    pub sort_key: SortKey,
     pub last_scan_path: Option<PathBuf>,
     pub size_mode: SizeMode,
     pub scan_profiles: Vec<ScanProfile>,
@@ -61,7 +61,7 @@ pub struct UiConfig {
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
-            default_view: View::BySize,
+            sort_key: SortKey::default(),
             last_scan_path: None,
             size_mode: SizeMode::Physical,
             scan_profiles: built_in_scan_profiles(),
@@ -190,7 +190,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::app::View;
+    use crate::columns::SortKey;
     use purifier_core::{Filter, FilterTest, ScanProfile, SizeMode};
 
     #[test]
@@ -200,7 +200,7 @@ mod tests {
 
         let config = AppConfig::load_or_default(&config_path).unwrap();
 
-        assert_eq!(config.ui.default_view, View::BySize);
+        assert_eq!(config.ui.sort_key, SortKey::Size);
         assert_eq!(config.ui.last_scan_path, None);
         assert_eq!(config.ui.size_mode, SizeMode::Physical);
         assert_eq!(
@@ -219,12 +219,12 @@ mod tests {
     }
 
     #[test]
-    fn save_should_round_trip_last_scan_path_and_default_view() {
+    fn save_should_round_trip_last_scan_path_and_sort_key() {
         let tempdir = tempfile::tempdir().unwrap();
         let config_path = tempdir.path().join("config.toml");
         let config = AppConfig {
             ui: UiConfig {
-                default_view: View::BySafety,
+                sort_key: SortKey::Safety,
                 last_scan_path: Some(PathBuf::from("/tmp/purifier")),
                 size_mode: SizeMode::Physical,
                 scan_profiles: Vec::new(),
@@ -237,7 +237,7 @@ mod tests {
         config.save(&config_path).unwrap();
         let loaded = AppConfig::load_or_default(&config_path).unwrap();
 
-        assert_eq!(loaded.ui.default_view, View::BySafety);
+        assert_eq!(loaded.ui.sort_key, SortKey::Safety);
         assert_eq!(
             loaded.ui.last_scan_path,
             Some(PathBuf::from("/tmp/purifier"))
@@ -250,7 +250,7 @@ mod tests {
         let config_path = tempdir.path().join("config.toml");
         let config = AppConfig {
             ui: UiConfig {
-                default_view: View::BySize,
+                sort_key: SortKey::Size,
                 last_scan_path: Some(PathBuf::from("/tmp/project")),
                 size_mode: SizeMode::Logical,
                 scan_profiles: vec![ScanProfile {
@@ -295,7 +295,7 @@ mod tests {
             &config_path,
             r#"
 [ui]
-default_view = "BySafety"
+sort_key = "Safety"
 last_scan_path = "/tmp/legacy-scan"
 
 [llm]
@@ -326,7 +326,7 @@ first_launch_prompt_dismissed = true
 
         let config = AppConfig::load_or_default(&config_path).unwrap();
 
-        assert_eq!(config.ui.default_view, View::BySafety);
+        assert_eq!(config.ui.sort_key, SortKey::Safety);
         assert_eq!(
             config.ui.last_scan_path,
             Some(PathBuf::from("/tmp/legacy-scan"))

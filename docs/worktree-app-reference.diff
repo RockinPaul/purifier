@@ -1,0 +1,1154 @@
+diff --git a/crates/purifier-tui/src/app.rs b/crates/purifier-tui/src/app.rs
+index ba1a48e..0eb35d2 100644
+--- a/crates/purifier-tui/src/app.rs
++++ b/crates/purifier-tui/src/app.rs
+@@ -1,5 +1,6 @@
+ use std::cmp::{Ordering, Reverse};
+-use std::collections::HashSet;
++use std::collections::{BTreeMap, HashMap, HashSet};
++use std::hash::{Hash, Hasher};
+ use std::path::{Path, PathBuf};
+ use std::time::SystemTime;
+ 
+@@ -132,12 +133,14 @@ pub struct App {
+     pub last_error: Option<String>,
+     pub last_warning: Option<String>,
+     pub expanded_paths: HashSet<PathBuf>,
++    pub collapsed_sections: HashSet<SectionKey>,
+     pub deleted_paths: HashSet<PathBuf>,
++    size_totals: HashMap<PathBuf, CachedTotals>,
+     pub llm_enabled: bool,
+     pub llm_status: LlmStatus,
+     pub llm_online: bool,
+     pub llm_connection_generation: u64,
+-    pub flat_entries: Vec<FlatEntry>,
++    pub flat_entries: Vec<FlatRow>,
+     // Scan progress (live during scan)
+     pub files_scanned: u64,
+     pub bytes_found: u64,
+@@ -152,7 +155,7 @@ pub struct App {
+     pub dir_picker_typing: bool,
+ }
+ 
+-#[derive(Debug, Clone)]
++#[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct FlatEntry {
+     pub depth: usize,
+     pub path: PathBuf,
+@@ -167,6 +170,173 @@ pub struct FlatEntry {
+     pub safety_reason: String,
+ }
+ 
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct SectionRow {
++    pub key: SectionKey,
++    pub label: String,
++    pub item_count: usize,
++    pub expanded: bool,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum FlatRow {
++    Section(SectionRow),
++    Entry(FlatEntry),
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++enum SelectedRowIdentity {
++    Section(SectionKey),
++    Entry(PathBuf),
++}
++
++impl FlatRow {
++    pub fn entry(&self) -> Option<&FlatEntry> {
++        match self {
++            Self::Entry(entry) => Some(entry),
++            Self::Section(_) => None,
++        }
++    }
++
++    pub fn size(&self) -> u64 {
++        match self {
++            Self::Section(_) => 0,
++            Self::Entry(entry) => entry.size,
++        }
++    }
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
++pub enum AgeBucket {
++    Older,
++    Last30Days,
++    Last7Days,
++    Today,
++    Unknown,
++}
++
++impl AgeBucket {
++    fn for_modified(modified: Option<SystemTime>) -> Self {
++        let Some(modified) = modified else {
++            return Self::Unknown;
++        };
++
++        let Ok(age) = SystemTime::now().duration_since(modified) else {
++            return Self::Today;
++        };
++
++        if age.as_secs() <= 24 * 60 * 60 {
++            Self::Today
++        } else if age.as_secs() <= 7 * 24 * 60 * 60 {
++            Self::Last7Days
++        } else if age.as_secs() <= 30 * 24 * 60 * 60 {
++            Self::Last30Days
++        } else {
++            Self::Older
++        }
++    }
++
++    fn label(self) -> &'static str {
++        match self {
++            Self::Older => "Older",
++            Self::Last30Days => "Last 30 Days",
++            Self::Last7Days => "Last 7 Days",
++            Self::Today => "Today",
++            Self::Unknown => "Unknown Age",
++        }
++    }
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
++pub enum SectionKey {
++    Type(Category),
++    Safety(SafetyLevel),
++    Age(AgeBucket),
++}
++
++impl Hash for SectionKey {
++    fn hash<H: Hasher>(&self, state: &mut H) {
++        match self {
++            Self::Type(category) => {
++                0_u8.hash(state);
++                (*category as u8).hash(state);
++            }
++            Self::Safety(safety) => {
++                1_u8.hash(state);
++                (*safety as u8).hash(state);
++            }
++            Self::Age(bucket) => {
++                2_u8.hash(state);
++                bucket.hash(state);
++            }
++        }
++    }
++}
++
++impl SectionKey {
++    fn label(self) -> String {
++        match self {
++            Self::Type(category) => category.to_string(),
++            Self::Safety(safety) => safety.to_string(),
++            Self::Age(bucket) => bucket.label().to_string(),
++        }
++    }
++}
++
++#[cfg(test)]
++#[derive(Debug)]
++struct SizedEntry<'a> {
++    _entry: &'a FileEntry,
++    logical_size: u64,
++    physical_size: u64,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
++struct CachedTotals {
++    logical_size: u64,
++    physical_size: u64,
++}
++
++impl CachedTotals {
++    fn display_size(self, mode: SizeMode) -> u64 {
++        match mode {
++            SizeMode::Logical => self.logical_size,
++            SizeMode::Physical => self.physical_size,
++        }
++    }
++}
++
++#[cfg(test)]
++impl<'a> SizedEntry<'a> {
++    fn build(entry: &'a FileEntry) -> Self {
++        let children = entry.children.iter().map(Self::build).collect::<Vec<_>>();
++        let (logical_size, physical_size) = if children.is_empty() {
++            (
++                entry.sizes.logical_bytes,
++                entry.sizes.accounted_physical_bytes,
++            )
++        } else {
++            (
++                children.iter().map(|child| child.logical_size).sum(),
++                children.iter().map(|child| child.physical_size).sum(),
++            )
++        };
++
++        Self {
++            _entry: entry,
++            logical_size,
++            physical_size,
++        }
++    }
++
++    fn display_size(&self, mode: SizeMode) -> u64 {
++        match mode {
++            SizeMode::Logical => self.logical_size,
++            SizeMode::Physical => self.physical_size,
++        }
++    }
++}
++
+ impl App {
+     pub fn new(scan_path: Option<PathBuf>, llm_enabled: bool, preferences: AppConfig) -> Self {
+         let screen = if scan_path.is_some() {
+@@ -201,7 +371,9 @@ impl App {
+             last_error: None,
+             last_warning: None,
+             expanded_paths: HashSet::new(),
++            collapsed_sections: HashSet::new(),
+             deleted_paths: HashSet::new(),
++            size_totals: HashMap::new(),
+             llm_enabled,
+             llm_status: if llm_enabled {
+                 LlmStatus::NeedsSetup
+@@ -304,7 +476,9 @@ impl App {
+         self.last_error = None;
+         self.last_warning = None;
+         self.expanded_paths.clear();
++        self.collapsed_sections.clear();
+         self.deleted_paths.clear();
++        self.size_totals.clear();
+     }
+ 
+     pub fn switch_view(&mut self, view: View) {
+@@ -359,26 +533,66 @@ impl App {
+     }
+ 
+     pub fn toggle_expand(&mut self) {
+-        if let Some(flat) = self.flat_entries.get(self.selected_index) {
+-            if flat.is_dir {
+-                let path = flat.path.clone();
+-                if let Some(entry) = self.get_entry_mut_by_path(&path) {
+-                    entry.expanded = !entry.expanded;
+-                    if entry.expanded {
+-                        self.expanded_paths.insert(path.clone());
++        if let Some(row) = self.flat_entries.get(self.selected_index).cloned() {
++            match row {
++                FlatRow::Section(section) => {
++                    if self.collapsed_sections.contains(&section.key) {
++                        self.collapsed_sections.remove(&section.key);
+                     } else {
+-                        self.expanded_paths.remove(&path);
++                        self.collapsed_sections.insert(section.key);
+                     }
++                    self.rebuild_flat_entries();
+                 }
+-                self.rebuild_flat_entries();
++                FlatRow::Entry(flat) if self.current_view == View::BySize && flat.is_dir => {
++                    let path = flat.path.clone();
++                    let mut is_expanded = flat.expanded;
++                    if let Some(entry) = self.get_entry_mut_by_path(&path) {
++                        entry.expanded = !entry.expanded;
++                        is_expanded = entry.expanded;
++                        if entry.expanded {
++                            self.expanded_paths.insert(path.clone());
++                        } else {
++                            self.expanded_paths.remove(&path);
++                        }
++                    }
++
++                    if let Some(FlatRow::Entry(entry)) =
++                        self.flat_entries.get_mut(self.selected_index)
++                    {
++                        entry.expanded = is_expanded;
++                    }
++
++                    if is_expanded {
++                        let subtree_rows = self.visible_size_subtree_rows(&path, flat.depth + 1);
++                        self.flat_entries.splice(
++                            self.selected_index + 1..self.selected_index + 1,
++                            subtree_rows,
++                        );
++                    } else {
++                        let start = self.selected_index + 1;
++                        let mut end = start;
++                        while let Some(FlatRow::Entry(entry)) = self.flat_entries.get(end) {
++                            if entry.depth <= flat.depth {
++                                break;
++                            }
++                            end += 1;
++                        }
++                        self.flat_entries.drain(start..end);
++                    }
++                }
++                FlatRow::Entry(_) => {}
+             }
+         }
+     }
+ 
+-    pub fn selected_entry(&self) -> Option<&FlatEntry> {
++    pub fn selected_row(&self) -> Option<&FlatRow> {
+         self.flat_entries.get(self.selected_index)
+     }
+ 
++    pub fn selected_entry(&self) -> Option<&FlatEntry> {
++        self.selected_row().and_then(FlatRow::entry)
++    }
++
+     pub fn remove_entry_by_path(&mut self, path: &Path) -> bool {
+         fn remove_entry(entries: &mut Vec<FileEntry>, path: &Path) -> bool {
+             if let Some(index) = entries.iter().position(|entry| entry.path == path) {
+@@ -425,100 +639,236 @@ impl App {
+         find_entry_mut(&mut self.entries, path)
+     }
+ 
++    fn get_entry_by_path(&self, path: &Path) -> Option<&FileEntry> {
++        fn find_entry<'a>(entries: &'a [FileEntry], path: &Path) -> Option<&'a FileEntry> {
++            for entry in entries {
++                if entry.path == path {
++                    return Some(entry);
++                }
++
++                if let Some(found) = find_entry(&entry.children, path) {
++                    return Some(found);
++                }
++            }
++
++            None
++        }
++
++        find_entry(&self.entries, path)
++    }
++
+     pub fn rebuild_flat_entries(&mut self) {
++        let selected_identity = self.selected_row_identity();
++        self.rebuild_size_totals();
+         self.flat_entries.clear();
+         match self.current_view {
+             View::BySize => self.flatten_by_size(),
+-            View::ByType => self.flatten_by_group(|e| e.category),
+-            View::BySafety => self.flatten_by_group(|e| e.safety),
++            View::ByType => self.flatten_by_group(|e| SectionKey::Type(e.category)),
++            View::BySafety => self.flatten_by_group(|e| SectionKey::Safety(e.safety)),
+             View::ByAge => self.flatten_by_age(),
+         }
++        self.restore_selected_row(selected_identity);
++    }
++
++    fn rebuild_size_totals(&mut self) {
++        self.size_totals.clear();
++        for entry in &self.entries {
++            Self::fill_size_totals(entry, &mut self.size_totals);
++        }
++    }
++
++    fn fill_size_totals(
++        entry: &FileEntry,
++        out: &mut HashMap<PathBuf, CachedTotals>,
++    ) -> CachedTotals {
++        let totals = if entry.children.is_empty() {
++            CachedTotals {
++                logical_size: entry.sizes.logical_bytes,
++                physical_size: entry.sizes.accounted_physical_bytes,
++            }
++        } else {
++            let mut logical_size = 0;
++            let mut physical_size = 0;
++            for child in &entry.children {
++                let child_totals = Self::fill_size_totals(child, out);
++                logical_size += child_totals.logical_size;
++                physical_size += child_totals.physical_size;
++            }
++            CachedTotals {
++                logical_size,
++                physical_size,
++            }
++        };
++
++        out.insert(entry.path.clone(), totals);
++        totals
++    }
++
++    fn cached_totals(&self, path: &Path) -> CachedTotals {
++        self.size_totals.get(path).copied().unwrap_or_default()
++    }
++
++    fn cached_display_size(&self, path: &Path, mode: SizeMode) -> u64 {
++        self.cached_totals(path).display_size(mode)
++    }
++
++    fn clamp_selected_index(&mut self) {
++        if self.flat_entries.is_empty() {
++            self.selected_index = 0;
++        } else {
++            self.selected_index = self.selected_index.min(self.flat_entries.len() - 1);
++        }
++    }
++
++    fn selected_row_identity(&self) -> Option<SelectedRowIdentity> {
++        match self.selected_row()? {
++            FlatRow::Section(section) => Some(SelectedRowIdentity::Section(section.key)),
++            FlatRow::Entry(entry) => Some(SelectedRowIdentity::Entry(entry.path.clone())),
++        }
++    }
++
++    fn restore_selected_row(&mut self, selected_identity: Option<SelectedRowIdentity>) {
++        if let Some(identity) = selected_identity {
++            if let Some(index) = self
++                .flat_entries
++                .iter()
++                .position(|row| match (&identity, row) {
++                    (SelectedRowIdentity::Section(key), FlatRow::Section(section)) => {
++                        section.key == *key
++                    }
++                    (SelectedRowIdentity::Entry(path), FlatRow::Entry(entry)) => {
++                        entry.path == *path
++                    }
++                    _ => false,
++                })
++            {
++                self.selected_index = index;
++                return;
++            }
++        }
++
++        self.clamp_selected_index();
+     }
+ 
+     fn flatten_by_size(&mut self) {
+-        let mut sorted = self.entries.clone();
+-        sorted.sort_by_key(|entry| Reverse(entry.total_size(self.size_mode())));
++        let size_mode = self.size_mode();
++        let mut sorted = self.entries.iter().collect::<Vec<_>>();
++        sorted.sort_by_key(|entry| Reverse(self.cached_display_size(&entry.path, size_mode)));
++        let mut flat_entries = Vec::new();
+ 
+         for entry in &sorted {
+-            self.flatten_entry(entry, 0);
++            Self::flatten_entry(entry, 0, size_mode, &self.size_totals, &mut flat_entries);
+         }
++
++        self.flat_entries = flat_entries;
+     }
+ 
+-    fn flatten_entry(&mut self, entry: &FileEntry, depth: usize) {
+-        self.flat_entries.push(FlatEntry {
++    fn flatten_entry(
++        entry: &FileEntry,
++        depth: usize,
++        size_mode: SizeMode,
++        size_totals: &HashMap<PathBuf, CachedTotals>,
++        out: &mut Vec<FlatRow>,
++    ) {
++        let cached = size_totals.get(&entry.path).copied().unwrap_or_default();
++
++        out.push(FlatRow::Entry(FlatEntry {
+             depth,
+             path: entry.path.clone(),
+-            size: entry.total_size(self.size_mode()),
+-            logical_size: entry.total_size(SizeMode::Logical),
+-            physical_size: entry.total_size(SizeMode::Physical),
++            size: cached.display_size(size_mode),
++            logical_size: cached.logical_size,
++            physical_size: cached.physical_size,
+             is_dir: entry.is_dir,
+             expanded: entry.expanded,
+             modified: entry.modified,
+             category: entry.category,
+             safety: entry.safety,
+             safety_reason: entry.safety_reason.clone(),
+-        });
++        }));
+ 
+         if entry.expanded {
+-            let mut children: Vec<&FileEntry> = entry.children.iter().collect();
+-            children.sort_by_key(|entry| Reverse(entry.total_size(self.size_mode())));
++            let mut children = entry.children.iter().collect::<Vec<_>>();
++            children.sort_by_key(|child| {
++                Reverse(
++                    size_totals
++                        .get(&child.path)
++                        .copied()
++                        .unwrap_or_default()
++                        .display_size(size_mode),
++                )
++            });
+ 
+             for child in children {
+-                self.flatten_entry(child, depth + 1);
++                Self::flatten_entry(child, depth + 1, size_mode, size_totals, out);
+             }
+         }
+     }
+ 
+-    fn flatten_by_group<K: Ord + std::fmt::Display, F: Fn(&FlatEntry) -> K>(&mut self, key_fn: F) {
+-        let mut all_flat = Vec::new();
+-        let sorted = {
+-            let mut s = self.entries.clone();
+-            s.sort_by_key(|entry| Reverse(entry.total_size(self.size_mode())));
+-            s
++    fn visible_size_subtree_rows(&self, path: &Path, depth: usize) -> Vec<FlatRow> {
++        let Some(entry) = self.get_entry_by_path(path) else {
++            return Vec::new();
+         };
+-        for entry in &sorted {
+-            Self::collect_flat(entry, 0, self.size_mode(), &mut all_flat);
++
++        let size_mode = self.size_mode();
++        let mut children = entry.children.iter().collect::<Vec<_>>();
++        children.sort_by_key(|child| Reverse(self.cached_display_size(&child.path, size_mode)));
++
++        let mut rows = Vec::new();
++        for child in children {
++            Self::flatten_entry(child, depth, size_mode, &self.size_totals, &mut rows);
+         }
+ 
+-        all_flat.sort_by(|a, b| {
+-            let ka = key_fn(a);
+-            let kb = key_fn(b);
+-            ka.cmp(&kb).then(b.size.cmp(&a.size))
+-        });
++        rows
++    }
++
++    fn flatten_by_group<F>(&mut self, key_fn: F)
++    where
++        F: Fn(&FlatEntry) -> SectionKey,
++    {
++        let mut all_flat = Vec::new();
++        let size_mode = self.size_mode();
++        for entry in &self.entries {
++            Self::collect_group_entries(entry, size_mode, &self.size_totals, &mut all_flat);
++        }
+ 
+-        self.flat_entries = all_flat;
++        self.flat_entries = self.build_grouped_rows(all_flat, |a, b| b.size.cmp(&a.size), key_fn);
+     }
+ 
+     fn flatten_by_age(&mut self) {
+         let mut all_flat = Vec::new();
++        let size_mode = self.size_mode();
+         for entry in &self.entries {
+-            Self::collect_flat(entry, 0, self.size_mode(), &mut all_flat);
++            Self::collect_group_entries(entry, size_mode, &self.size_totals, &mut all_flat);
+         }
+ 
+-        all_flat.sort_by(|a, b| match (a.modified, b.modified) {
+-            (Some(a_modified), Some(b_modified)) => {
+-                a_modified.cmp(&b_modified).then(b.size.cmp(&a.size))
+-            }
+-            (Some(_), None) => Ordering::Less,
+-            (None, Some(_)) => Ordering::Greater,
+-            (None, None) => b.size.cmp(&a.size),
+-        });
+-
+-        self.flat_entries = all_flat;
++        self.flat_entries = self.build_grouped_rows(
++            all_flat,
++            |a, b| match (a.modified, b.modified) {
++                (Some(a_modified), Some(b_modified)) => {
++                    a_modified.cmp(&b_modified).then(b.size.cmp(&a.size))
++                }
++                (Some(_), None) => Ordering::Less,
++                (None, Some(_)) => Ordering::Greater,
++                (None, None) => b.size.cmp(&a.size),
++            },
++            |entry| SectionKey::Age(AgeBucket::for_modified(entry.modified)),
++        );
+     }
+ 
+-    fn collect_flat(
++    fn collect_group_entries(
+         entry: &FileEntry,
+-        depth: usize,
+         size_mode: SizeMode,
++        size_totals: &HashMap<PathBuf, CachedTotals>,
+         out: &mut Vec<FlatEntry>,
+     ) {
++        let cached = size_totals.get(&entry.path).copied().unwrap_or_default();
++
+         out.push(FlatEntry {
+-            depth,
++            depth: 1,
+             path: entry.path.clone(),
+-            size: entry.total_size(size_mode),
+-            logical_size: entry.total_size(SizeMode::Logical),
+-            physical_size: entry.total_size(SizeMode::Physical),
++            size: cached.display_size(size_mode),
++            logical_size: cached.logical_size,
++            physical_size: cached.physical_size,
+             is_dir: entry.is_dir,
+             expanded: entry.expanded,
+             modified: entry.modified,
+@@ -528,9 +878,43 @@ impl App {
+         });
+ 
+         for child in &entry.children {
+-            Self::collect_flat(child, depth + 1, size_mode, out);
++            Self::collect_group_entries(child, size_mode, size_totals, out);
+         }
+     }
++
++    fn build_grouped_rows<F, S>(
++        &self,
++        entries: Vec<FlatEntry>,
++        sort_entries: S,
++        section_key: F,
++    ) -> Vec<FlatRow>
++    where
++        F: Fn(&FlatEntry) -> SectionKey,
++        S: Fn(&FlatEntry, &FlatEntry) -> Ordering,
++    {
++        let mut groups = BTreeMap::<SectionKey, Vec<FlatEntry>>::new();
++        for entry in entries {
++            groups.entry(section_key(&entry)).or_default().push(entry);
++        }
++
++        let mut rows = Vec::new();
++        for (key, mut group_entries) in groups {
++            group_entries.sort_by(|a, b| sort_entries(a, b));
++            let expanded = !self.collapsed_sections.contains(&key);
++            rows.push(FlatRow::Section(SectionRow {
++                key,
++                label: key.label(),
++                item_count: group_entries.len(),
++                expanded,
++            }));
++
++            if expanded {
++                rows.extend(group_entries.into_iter().map(FlatRow::Entry));
++            }
++        }
++
++        rows
++    }
+ }
+ 
+ fn build_dir_picker_options() -> Vec<PathBuf> {
+@@ -573,6 +957,29 @@ mod tests {
+         FileEntry::new(PathBuf::from(path), size, false, modified)
+     }
+ 
++    fn visible_paths(app: &App) -> Vec<PathBuf> {
++        app.flat_entries
++            .iter()
++            .filter_map(|row| row.entry().map(|entry| entry.path.clone()))
++            .collect()
++    }
++
++    fn custom_flat_file(path: &str, size: u64) -> FlatRow {
++        FlatRow::Entry(FlatEntry {
++            depth: 0,
++            path: PathBuf::from(path),
++            size,
++            logical_size: size,
++            physical_size: size,
++            is_dir: false,
++            expanded: false,
++            modified: None,
++            category: Category::Unknown,
++            safety: SafetyLevel::Unknown,
++            safety_reason: String::new(),
++        })
++    }
++
+     #[test]
+     fn toggle_expand_should_target_selected_path_when_entries_are_size_sorted() {
+         let mut app = App::new(Some(PathBuf::from("/")), false, AppConfig::default());
+@@ -590,6 +997,223 @@ mod tests {
+         assert!(app.entries[1].expanded, "large should expand");
+     }
+ 
++    #[test]
++    fn size_view_expand_should_insert_only_selected_subtree_rows() {
++        let mut parent = dir("/parent", 100);
++        parent.children.push(file("/parent/a", 30, None));
++        parent.children.push(file("/parent/b", 20, None));
++
++        let mut app = App::new(Some(PathBuf::from("/")), false, AppConfig::default());
++        app.entries = vec![parent, file("/sibling", 10, None)];
++        app.rebuild_flat_entries();
++
++        assert_eq!(
++            visible_paths(&app),
++            vec![PathBuf::from("/parent"), PathBuf::from("/sibling")]
++        );
++
++        app.toggle_expand();
++
++        assert_eq!(
++            visible_paths(&app),
++            vec![
++                PathBuf::from("/parent"),
++                PathBuf::from("/parent/a"),
++                PathBuf::from("/parent/b"),
++                PathBuf::from("/sibling"),
++            ]
++        );
++        assert_eq!(
++            app.selected_entry().map(|entry| entry.path.as_path()),
++            Some(Path::new("/parent"))
++        );
++    }
++
++    #[test]
++    fn size_view_expand_should_preserve_rows_outside_the_inserted_subtree_slice() {
++        let mut parent = dir("/parent", 100);
++        parent.children.push(file("/parent/a", 30, None));
++        parent.children.push(file("/parent/b", 20, None));
++
++        let mut app = App::new(Some(PathBuf::from("/")), false, AppConfig::default());
++        app.entries = vec![parent];
++        app.rebuild_flat_entries();
++        app.flat_entries.push(custom_flat_file("/sentinel", 1));
++
++        app.toggle_expand();
++
++        assert_eq!(
++            app.flat_entries,
++            vec![
++                FlatRow::Entry(FlatEntry {
++                    depth: 0,
++                    path: PathBuf::from("/parent"),
++                    size: 50,
++                    logical_size: 50,
++                    physical_size: 50,
++                    is_dir: true,
++                    expanded: true,
++                    modified: None,
++                    category: Category::Unknown,
++                    safety: SafetyLevel::Unknown,
++                    safety_reason: String::new(),
++                }),
++                FlatRow::Entry(FlatEntry {
++                    depth: 1,
++                    path: PathBuf::from("/parent/a"),
++                    size: 30,
++                    logical_size: 30,
++                    physical_size: 30,
++                    is_dir: false,
++                    expanded: false,
++                    modified: None,
++                    category: Category::Unknown,
++                    safety: SafetyLevel::Unknown,
++                    safety_reason: String::new(),
++                }),
++                FlatRow::Entry(FlatEntry {
++                    depth: 1,
++                    path: PathBuf::from("/parent/b"),
++                    size: 20,
++                    logical_size: 20,
++                    physical_size: 20,
++                    is_dir: false,
++                    expanded: false,
++                    modified: None,
++                    category: Category::Unknown,
++                    safety: SafetyLevel::Unknown,
++                    safety_reason: String::new(),
++                }),
++                custom_flat_file("/sentinel", 1),
++            ]
++        );
++    }
++
++    #[test]
++    fn size_view_collapse_should_remove_only_selected_subtree_rows() {
++        let mut parent = dir("/parent", 100);
++        parent.expanded = true;
++        parent.children.push(file("/parent/a", 30, None));
++        parent.children.push(file("/parent/b", 20, None));
++
++        let mut app = App::new(Some(PathBuf::from("/")), false, AppConfig::default());
++        app.entries = vec![parent, file("/sibling", 10, None)];
++        app.expanded_paths.insert(PathBuf::from("/parent"));
++        app.rebuild_flat_entries();
++
++        assert_eq!(
++            visible_paths(&app),
++            vec![
++                PathBuf::from("/parent"),
++                PathBuf::from("/parent/a"),
++                PathBuf::from("/parent/b"),
++                PathBuf::from("/sibling"),
++            ]
++        );
++
++        app.toggle_expand();
++
++        assert_eq!(
++            visible_paths(&app),
++            vec![PathBuf::from("/parent"), PathBuf::from("/sibling")]
++        );
++        assert_eq!(
++            app.selected_entry().map(|entry| entry.path.as_path()),
++            Some(Path::new("/parent"))
++        );
++    }
++
++    #[test]
++    fn size_view_collapse_should_preserve_rows_outside_the_removed_subtree_slice() {
++        let mut parent = dir("/parent", 100);
++        parent.expanded = true;
++        parent.children.push(file("/parent/a", 30, None));
++        parent.children.push(file("/parent/b", 20, None));
++
++        let mut app = App::new(Some(PathBuf::from("/")), false, AppConfig::default());
++        app.entries = vec![parent];
++        app.expanded_paths.insert(PathBuf::from("/parent"));
++        app.rebuild_flat_entries();
++        app.flat_entries.push(custom_flat_file("/sentinel", 1));
++
++        app.toggle_expand();
++
++        assert_eq!(
++            app.flat_entries,
++            vec![
++                FlatRow::Entry(FlatEntry {
++                    depth: 0,
++                    path: PathBuf::from("/parent"),
++                    size: 50,
++                    logical_size: 50,
++                    physical_size: 50,
++                    is_dir: true,
++                    expanded: false,
++                    modified: None,
++                    category: Category::Unknown,
++                    safety: SafetyLevel::Unknown,
++                    safety_reason: String::new(),
++                }),
++                custom_flat_file("/sentinel", 1),
++            ]
++        );
++    }
++
++    #[test]
++    fn size_view_expand_should_include_visible_nested_expanded_descendants() {
++        let mut nested = dir("/parent/nested", 60);
++        nested.expanded = true;
++        nested.children.push(file("/parent/nested/deep", 50, None));
++
++        let mut parent = dir("/parent", 100);
++        parent.children.push(nested);
++        parent.children.push(file("/parent/shallow", 20, None));
++
++        let mut app = App::new(Some(PathBuf::from("/")), false, AppConfig::default());
++        app.entries = vec![parent, file("/sibling", 10, None)];
++        app.expanded_paths.insert(PathBuf::from("/parent/nested"));
++        app.rebuild_flat_entries();
++
++        app.toggle_expand();
++
++        assert_eq!(
++            visible_paths(&app),
++            vec![
++                PathBuf::from("/parent"),
++                PathBuf::from("/parent/nested"),
++                PathBuf::from("/parent/nested/deep"),
++                PathBuf::from("/parent/shallow"),
++                PathBuf::from("/sibling"),
++            ]
++        );
++    }
++
++    #[test]
++    fn grouped_views_should_ignore_directory_entry_toggles() {
++        let mut parent = dir("/parent", 100);
++        parent.children.push(file("/parent/child", 20, None));
++
++        let mut app = App::new(Some(PathBuf::from("/")), false, AppConfig::default());
++        app.entries = vec![parent];
++        app.switch_view(View::ByType);
++
++        let before = app.flat_entries.clone();
++        let before_expanded = app.entries[0].expanded;
++        let entry_index = app
++            .flat_entries
++            .iter()
++            .position(
++                |row| matches!(row, FlatRow::Entry(entry) if entry.path == Path::new("/parent")),
++            )
++            .expect("grouped view entry should exist");
++        app.selected_index = entry_index;
++
++        app.toggle_expand();
++
++        assert_eq!(app.flat_entries, before);
++        assert_eq!(app.entries[0].expanded, before_expanded);
++    }
++
+     #[test]
+     fn remove_entry_by_path_should_remove_selected_path_when_entries_are_size_sorted() {
+         let mut app = App::new(Some(PathBuf::from("/")), false, AppConfig::default());
+@@ -622,7 +1246,7 @@ mod tests {
+         let paths: Vec<PathBuf> = app
+             .flat_entries
+             .iter()
+-            .map(|entry| entry.path.clone())
++            .filter_map(|row| row.entry().map(|entry| entry.path.clone()))
+             .collect();
+         assert_eq!(
+             paths,
+@@ -648,7 +1272,7 @@ mod tests {
+         let paths: Vec<PathBuf> = app
+             .flat_entries
+             .iter()
+-            .map(|entry| entry.path.clone())
++            .filter_map(|row| row.entry().map(|entry| entry.path.clone()))
+             .collect();
+         assert_eq!(
+             paths,
+@@ -656,6 +1280,181 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn type_view_should_insert_section_headers_before_group_entries() {
++        let mut build = file("/tmp/build.log", 20, None);
++        build.category = Category::BuildArtifact;
++        let mut cache = file("/tmp/cache.db", 10, None);
++        cache.category = Category::Cache;
++
++        let mut app = App::new(Some(PathBuf::from("/")), false, AppConfig::default());
++        app.entries = vec![build, cache];
++
++        app.switch_view(View::ByType);
++
++        assert!(
++            matches!(
++                app.flat_entries.first(),
++                Some(FlatRow::Section(section)) if section.label == "Build Artifact"
++            ),
++            "type view should start with a section header row"
++        );
++        assert!(
++            matches!(
++                app.flat_entries.get(1),
++                Some(FlatRow::Entry(entry)) if entry.path == std::path::Path::new("/tmp/build.log")
++            ),
++            "the first group entry should follow its section header"
++        );
++    }
++
++    #[test]
++    fn toggling_grouped_section_should_only_collapse_that_group() {
++        let mut build = file("/tmp/build.log", 20, None);
++        build.category = Category::BuildArtifact;
++        let mut cache = file("/tmp/cache.db", 10, None);
++        cache.category = Category::Cache;
++
++        let mut app = App::new(Some(PathBuf::from("/")), false, AppConfig::default());
++        app.entries = vec![build, cache];
++
++        app.switch_view(View::ByType);
++        app.toggle_expand();
++
++        let rows = app
++            .flat_entries
++            .iter()
++            .map(|row| match row {
++                FlatRow::Section(section) => {
++                    format!("section:{}:{}", section.label, section.expanded)
++                }
++                FlatRow::Entry(entry) => format!("entry:{}", entry.path.display()),
++            })
++            .collect::<Vec<_>>();
++
++        assert_eq!(
++            rows,
++            vec![
++                "section:Build Artifact:false".to_string(),
++                "section:Cache:true".to_string(),
++                "entry:/tmp/cache.db".to_string(),
++            ],
++            "collapsing one section should only hide that section's entries"
++        );
++    }
++
++    #[test]
++    fn regrouping_should_clamp_selection_to_last_available_row() {
++        let mut build = file("/tmp/build.log", 20, None);
++        build.category = Category::BuildArtifact;
++        let mut cache = file("/tmp/cache.db", 10, None);
++        cache.category = Category::Cache;
++
++        let mut app = App::new(Some(PathBuf::from("/")), false, AppConfig::default());
++        app.entries = vec![build, cache];
++        app.switch_view(View::ByType);
++        app.selected_index = app.flat_entries.len() - 1;
++        app.entries.pop();
++
++        app.rebuild_flat_entries();
++
++        assert!(app.selected_index < app.flat_entries.len());
++    }
++
++    #[test]
++    fn regrouping_should_preserve_selected_entry_identity_when_section_order_changes() {
++        let mut first = file("/tmp/first.bin", 20, None);
++        first.category = Category::BuildArtifact;
++        let mut second = file("/tmp/second.bin", 10, None);
++        second.category = Category::Cache;
++
++        let mut app = App::new(Some(PathBuf::from("/")), false, AppConfig::default());
++        app.entries = vec![first, second];
++        app.switch_view(View::ByType);
++        app.selected_index = app
++            .flat_entries
++            .iter()
++            .position(|row| matches!(row, FlatRow::Entry(entry) if entry.path == Path::new("/tmp/second.bin")))
++            .expect("selected entry should exist");
++
++        app.entries[1].category = Category::AppData;
++        app.rebuild_flat_entries();
++
++        assert!(matches!(
++            app.selected_row(),
++            Some(FlatRow::Entry(entry)) if entry.path == Path::new("/tmp/second.bin")
++        ));
++    }
++
++    #[test]
++    fn regrouping_should_preserve_selected_section_identity_when_section_order_changes() {
++        let mut first = file("/tmp/first.bin", 20, None);
++        first.category = Category::BuildArtifact;
++        let mut second = file("/tmp/second.bin", 10, None);
++        second.category = Category::Cache;
++
++        let mut app = App::new(Some(PathBuf::from("/")), false, AppConfig::default());
++        app.entries = vec![first, second];
++        app.switch_view(View::ByType);
++        app.selected_index = 0;
++
++        app.entries[1].category = Category::AppData;
++        app.rebuild_flat_entries();
++
++        assert!(matches!(
++            app.selected_row(),
++            Some(FlatRow::Section(section)) if section.key == SectionKey::Type(Category::BuildArtifact)
++        ));
++    }
++
++    #[test]
++    fn safety_view_should_insert_section_headers_before_group_entries() {
++        let mut safe = file("/tmp/safe.bin", 20, None);
++        safe.safety = SafetyLevel::Safe;
++        let mut caution = file("/tmp/caution.bin", 10, None);
++        caution.safety = SafetyLevel::Caution;
++
++        let mut app = App::new(Some(PathBuf::from("/")), false, AppConfig::default());
++        app.entries = vec![safe, caution];
++
++        app.switch_view(View::BySafety);
++
++        assert!(matches!(
++            app.flat_entries.first(),
++            Some(FlatRow::Section(_))
++        ));
++        assert!(app
++            .flat_entries
++            .iter()
++            .any(|row| matches!(row, FlatRow::Section(section) if section.key == SectionKey::Safety(SafetyLevel::Safe))));
++    }
++
++    #[test]
++    fn age_view_should_insert_section_headers_before_group_entries() {
++        let today = SystemTime::now() - Duration::from_secs(60 * 60);
++        let older = SystemTime::now() - Duration::from_secs(40 * 24 * 60 * 60);
++        let recent = file("/tmp/recent.bin", 20, Some(today));
++        let stale = file("/tmp/stale.bin", 10, Some(older));
++
++        let mut app = App::new(Some(PathBuf::from("/")), false, AppConfig::default());
++        app.entries = vec![recent, stale];
++
++        app.switch_view(View::ByAge);
++
++        assert!(matches!(
++            app.flat_entries.first(),
++            Some(FlatRow::Section(_))
++        ));
++        assert!(app
++            .flat_entries
++            .iter()
++            .any(|row| matches!(row, FlatRow::Section(section) if section.key == SectionKey::Age(AgeBucket::Today))));
++        assert!(app
++            .flat_entries
++            .iter()
++            .any(|row| matches!(row, FlatRow::Section(section) if section.key == SectionKey::Age(AgeBucket::Older))));
++    }
++
+     #[test]
+     fn size_view_should_sort_by_selected_size_mode() {
+         let entries = vec![
+@@ -692,7 +1491,7 @@ mod tests {
+         let logical_paths: Vec<PathBuf> = logical_app
+             .flat_entries
+             .iter()
+-            .map(|entry| entry.path.clone())
++            .filter_map(|row| row.entry().map(|entry| entry.path.clone()))
+             .collect();
+         assert_eq!(
+             logical_paths,
+@@ -701,7 +1500,7 @@ mod tests {
+                 PathBuf::from("/physical-large"),
+             ]
+         );
+-        assert_eq!(logical_app.flat_entries[0].size, 20);
++        assert_eq!(logical_app.flat_entries[0].size(), 20);
+ 
+         let mut physical_config = AppConfig::default();
+         physical_config.ui.size_mode = SizeMode::Physical;
+@@ -712,7 +1511,7 @@ mod tests {
+         let physical_paths: Vec<PathBuf> = physical_app
+             .flat_entries
+             .iter()
+-            .map(|entry| entry.path.clone())
++            .filter_map(|row| row.entry().map(|entry| entry.path.clone()))
+             .collect();
+         assert_eq!(
+             physical_paths,
+@@ -721,7 +1520,7 @@ mod tests {
+                 PathBuf::from("/logical-large"),
+             ]
+         );
+-        assert_eq!(physical_app.flat_entries[0].size, 8192);
++        assert_eq!(physical_app.flat_entries[0].size(), 8192);
+     }
+ 
+     #[test]
+@@ -743,4 +1542,28 @@ mod tests {
+         };
+         assert_eq!(draft.selected_scan_profile, None);
+     }
++
++    #[test]
++    fn sized_entry_tree_should_cache_directory_totals_from_children() {
++        let mut parent = dir("/parent", 0);
++        parent.children.push(file("/parent/a", 10, None));
++        parent.children.push(FileEntry::new_with_sizes(
++            PathBuf::from("/parent/b"),
++            EntrySizes {
++                logical_bytes: 20,
++                physical_bytes: 4096,
++                accounted_physical_bytes: 2048,
++            },
++            None,
++            false,
++            None,
++        ));
++
++        let sized = SizedEntry::build(&parent);
++
++        assert_eq!(sized.logical_size, 30);
++        assert_eq!(sized.physical_size, 2058);
++        assert_eq!(sized.display_size(SizeMode::Logical), 30);
++        assert_eq!(sized.display_size(SizeMode::Physical), 2058);
++    }
+ }

@@ -1,71 +1,14 @@
-use std::cmp::{Ordering, Reverse};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 use purifier_core::provider::{default_provider_settings, ProviderKind};
 use purifier_core::size::SizeMode;
 use purifier_core::types::{Category, FileEntry, SafetyLevel};
 use purifier_core::DeleteOutcome;
 
+use crate::columns::{find_children, find_entry, sorted_children, ColumnStack};
 use crate::config::AppConfig;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[expect(
-    clippy::enum_variant_names,
-    reason = "Tab names intentionally mirror the user-visible By Size/By Type/By Safety/By Age labels"
-)]
-pub enum View {
-    BySize,
-    ByType,
-    BySafety,
-    ByAge,
-}
-
-#[cfg(test)]
-mod modal_tests {
-    use std::path::PathBuf;
-
-    use super::*;
-    use crate::config::AppConfig;
-    use purifier_core::provider::ProviderKind;
-
-    #[test]
-    fn start_scan_with_path_should_record_last_scan_path_for_persistence() {
-        let mut app = App::new(Some(PathBuf::from("/")), false, AppConfig::default());
-
-        app.start_scan_with_path(PathBuf::from("/tmp/project"));
-
-        assert_eq!(
-            app.preferences.ui.last_scan_path,
-            Some(PathBuf::from("/tmp/project"))
-        );
-    }
-
-    #[test]
-    fn onboarding_modal_should_default_to_openrouter_when_no_provider_is_configured() {
-        let mut app = App::new(Some(PathBuf::from("/")), true, AppConfig::default());
-        app.open_onboarding();
-
-        match app.modal.as_ref() {
-            Some(AppModal::Onboarding(draft)) => {
-                assert_eq!(draft.provider, ProviderKind::OpenRouter)
-            }
-            other => panic!("expected onboarding modal, got {other:?}"),
-        }
-    }
-}
-
-impl View {
-    pub fn label(&self) -> &'static str {
-        match self {
-            View::BySize => "Size",
-            View::ByType => "Type",
-            View::BySafety => "Safety",
-            View::ByAge => "Age",
-        }
-    }
-}
+use crate::marks::MarkSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanStatus {
@@ -76,6 +19,7 @@ pub enum ScanStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppScreen {
+    Onboarding,
     DirPicker,
     Main,
 }
@@ -102,19 +46,27 @@ pub struct SettingsDraft {
     pub selected_scan_profile: Option<String>,
 }
 
+/// What the preview (right) pane currently shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AppModal {
-    DeleteConfirm,
+pub enum PreviewMode {
+    /// Type/age/safety analytics for the selected entry.
+    Analytics,
+    /// Quick-delete confirmation for one path.
+    DeleteConfirm(PathBuf),
+    /// Batch-delete review of all marked items.
+    BatchReview,
+    /// Settings form rendered in the preview pane.
     Settings(SettingsDraft),
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Onboarding form (only used on AppScreen::Onboarding).
     Onboarding(SettingsDraft),
 }
 
 pub struct App {
     pub screen: AppScreen,
     pub entries: Vec<FileEntry>,
-    pub current_view: View,
-    pub selected_index: usize,
+    pub columns: ColumnStack,
+    pub marks: MarkSet,
+    pub preview_mode: PreviewMode,
     pub scan_status: ScanStatus,
     pub total_size: u64,
     pub total_logical_size: u64,
@@ -125,19 +77,16 @@ pub struct App {
     pub scan_path: PathBuf,
     pub should_quit: bool,
     pub preferences: AppConfig,
-    pub modal: Option<AppModal>,
     pub settings_modal_is_saving: bool,
     pub settings_modal_error: Option<String>,
     pub pending_settings_validation_generation: Option<u64>,
     pub last_error: Option<String>,
     pub last_warning: Option<String>,
-    pub expanded_paths: HashSet<PathBuf>,
     pub deleted_paths: HashSet<PathBuf>,
     pub llm_enabled: bool,
     pub llm_status: LlmStatus,
     pub llm_online: bool,
     pub llm_connection_generation: u64,
-    pub flat_entries: Vec<FlatEntry>,
     // Scan progress (live during scan)
     pub files_scanned: u64,
     pub bytes_found: u64,
@@ -145,26 +94,16 @@ pub struct App {
     pub physical_bytes_found: u64,
     pub current_scan_dir: String,
     pub applied_scan_profile_name: Option<String>,
+    // LLM classification tracking
+    pub llm_classified_count: u64,
+    pub llm_pending_count: u64,
+    // Batch review scroll position
+    pub batch_review_selected: usize,
     // Directory picker
     pub dir_picker_options: Vec<PathBuf>,
     pub dir_picker_selected: usize,
     pub dir_picker_custom: String,
     pub dir_picker_typing: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct FlatEntry {
-    pub depth: usize,
-    pub path: PathBuf,
-    pub size: u64,
-    pub logical_size: u64,
-    pub physical_size: u64,
-    pub is_dir: bool,
-    pub expanded: bool,
-    pub modified: Option<SystemTime>,
-    pub category: Category,
-    pub safety: SafetyLevel,
-    pub safety_reason: String,
 }
 
 impl App {
@@ -174,14 +113,19 @@ impl App {
         } else {
             AppScreen::DirPicker
         };
-        let current_view = preferences.ui.default_view;
+        let sort_key = preferences.ui.sort_key;
         let dir_picker_options = build_dir_picker_options();
+        let root = scan_path
+            .clone()
+            .or_else(|| preferences.ui.last_scan_path.clone())
+            .unwrap_or_else(|| PathBuf::from("/"));
 
         Self {
             screen,
             entries: Vec::new(),
-            current_view,
-            selected_index: 0,
+            columns: ColumnStack::new(root.clone(), sort_key),
+            marks: MarkSet::new(),
+            preview_mode: PreviewMode::Analytics,
             scan_status: ScanStatus::Idle,
             total_size: 0,
             total_logical_size: 0,
@@ -189,18 +133,14 @@ impl App {
             total_files: 0,
             skipped: 0,
             delete_stats: DeleteOutcome::default(),
-            scan_path: scan_path
-                .or_else(|| preferences.ui.last_scan_path.clone())
-                .unwrap_or_else(|| PathBuf::from("/")),
+            scan_path: root,
             should_quit: false,
             preferences,
-            modal: None,
             settings_modal_is_saving: false,
             settings_modal_error: None,
             pending_settings_validation_generation: None,
             last_error: None,
             last_warning: None,
-            expanded_paths: HashSet::new(),
             deleted_paths: HashSet::new(),
             llm_enabled,
             llm_status: if llm_enabled {
@@ -210,13 +150,15 @@ impl App {
             },
             llm_online: false,
             llm_connection_generation: 0,
-            flat_entries: Vec::new(),
             files_scanned: 0,
             bytes_found: 0,
             logical_bytes_found: 0,
             physical_bytes_found: 0,
             current_scan_dir: String::new(),
             applied_scan_profile_name: None,
+            llm_classified_count: 0,
+            llm_pending_count: 0,
+            batch_review_selected: 0,
             dir_picker_options,
             dir_picker_selected: 0,
             dir_picker_custom: String::new(),
@@ -224,35 +166,31 @@ impl App {
         }
     }
 
+    // -- Settings and modal management --
+
     pub fn open_settings(&mut self) {
         self.settings_modal_is_saving = false;
         self.settings_modal_error = None;
         self.pending_settings_validation_generation = None;
-        self.modal = Some(AppModal::Settings(self.build_settings_draft()));
+        self.preview_mode = PreviewMode::Settings(self.build_settings_draft());
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn open_onboarding(&mut self) {
         self.settings_modal_is_saving = false;
         self.settings_modal_error = None;
         self.pending_settings_validation_generation = None;
-        self.modal = Some(AppModal::Onboarding(self.build_settings_draft()));
+        self.preview_mode = PreviewMode::Onboarding(self.build_settings_draft());
     }
 
-    pub fn open_delete_confirm(&mut self) {
-        self.modal = Some(AppModal::DeleteConfirm);
-    }
-
-    pub fn close_modal(&mut self) {
-        self.modal = None;
+    pub fn close_preview_modal(&mut self) {
+        self.preview_mode = PreviewMode::Analytics;
         self.settings_modal_is_saving = false;
         self.settings_modal_error = None;
         self.pending_settings_validation_generation = None;
     }
 
-    fn build_settings_draft(&self) -> SettingsDraft {
+    pub fn build_settings_draft(&self) -> SettingsDraft {
         let provider = match self.preferences.llm.active_provider {
-            // TODO(#ollama-support): restore direct Ollama editing when runtime support returns.
             ProviderKind::Ollama => ProviderKind::OpenRouter,
             provider => provider,
         };
@@ -280,14 +218,17 @@ impl App {
         }
     }
 
+    // -- Scan management --
+
     pub fn start_scan_with_path(&mut self, path: PathBuf) {
         self.preferences.ui.last_scan_path = Some(path.clone());
-        self.scan_path = path;
+        self.scan_path = path.clone();
         self.screen = AppScreen::Main;
         self.scan_status = ScanStatus::Scanning;
         self.entries.clear();
-        self.flat_entries.clear();
-        self.selected_index = 0;
+        self.columns = ColumnStack::new(path, self.columns.sort_key);
+        self.marks.clear();
+        self.preview_mode = PreviewMode::Analytics;
         self.total_size = 0;
         self.total_logical_size = 0;
         self.total_physical_size = 0;
@@ -300,24 +241,20 @@ impl App {
         self.physical_bytes_found = 0;
         self.current_scan_dir.clear();
         self.applied_scan_profile_name = None;
-        self.close_modal();
         self.last_error = None;
         self.last_warning = None;
-        self.expanded_paths.clear();
         self.deleted_paths.clear();
+        self.llm_classified_count = 0;
+        self.llm_pending_count = 0;
     }
 
-    pub fn switch_view(&mut self, view: View) {
-        self.current_view = view;
-        self.preferences.ui.default_view = view;
-        self.selected_index = 0;
-        self.rebuild_flat_entries();
-    }
+    // -- Size mode --
 
     pub fn size_mode(&self) -> SizeMode {
         self.preferences.ui.size_mode
     }
 
+    #[allow(dead_code)] // May be used by status bar or scan display
     pub fn active_scan_profile_name(&self) -> Option<&str> {
         match self.scan_status {
             ScanStatus::Scanning | ScanStatus::Complete => {
@@ -341,43 +278,52 @@ impl App {
         };
     }
 
-    pub fn move_up(&mut self) {
-        if self.selected_index > 0 {
-            self.selected_index -= 1;
+    // -- Column navigation helpers --
+
+    /// Get the children of the directory at `path` in the entry tree.
+    pub fn children_at_path(&self, path: &Path) -> Option<&[FileEntry]> {
+        // If path is the scan root, the top-level entries are the children
+        if path == self.scan_path {
+            return Some(&self.entries);
         }
+        find_children(&self.entries, path)
     }
 
-    pub fn move_down(&mut self) {
-        let max = if self.flat_entries.is_empty() {
-            0
-        } else {
-            self.flat_entries.len() - 1
-        };
-        if self.selected_index < max {
-            self.selected_index += 1;
-        }
+    /// Look up a single entry by path in the tree.
+    pub fn entry_at_path(&self, path: &Path) -> Option<&FileEntry> {
+        find_entry(&self.entries, path)
     }
 
-    pub fn toggle_expand(&mut self) {
-        if let Some(flat) = self.flat_entries.get(self.selected_index) {
-            if flat.is_dir {
-                let path = flat.path.clone();
-                if let Some(entry) = self.get_entry_mut_by_path(&path) {
-                    entry.expanded = !entry.expanded;
-                    if entry.expanded {
-                        self.expanded_paths.insert(path.clone());
-                    } else {
-                        self.expanded_paths.remove(&path);
-                    }
-                }
-                self.rebuild_flat_entries();
-            }
-        }
+    /// Get the entry currently highlighted in the current column.
+    pub fn selected_entry(&self) -> Option<&FileEntry> {
+        let col = self.columns.current();
+        let children = self.children_at_path(&col.path)?;
+        let sorted = sorted_children(children, self.columns.sort_key, self.size_mode());
+        let idx = sorted.get(col.selected_index)?;
+        children.get(*idx)
     }
 
-    pub fn selected_entry(&self) -> Option<&FlatEntry> {
-        self.flat_entries.get(self.selected_index)
+    /// Get the path of the currently selected entry.
+    pub fn selected_path(&self) -> Option<PathBuf> {
+        self.selected_entry().map(|e| e.path.clone())
     }
+
+    /// How many children the current column has.
+    pub fn current_children_count(&self) -> usize {
+        self.children_at_path(self.columns.current_path())
+            .map_or(0, |c| c.len())
+    }
+
+    /// How many children the parent column has.
+    #[allow(dead_code)] // Used by status_bar once Task 10 is done
+    pub fn parent_children_count(&self) -> usize {
+        self.columns
+            .parent()
+            .and_then(|parent| self.children_at_path(&parent.path))
+            .map_or(0, |c| c.len())
+    }
+
+    // -- Entry mutation --
 
     pub fn remove_entry_by_path(&mut self, path: &Path) -> bool {
         fn remove_entry(entries: &mut Vec<FileEntry>, path: &Path) -> bool {
@@ -385,150 +331,65 @@ impl App {
                 entries.remove(index);
                 return true;
             }
-
             for entry in entries {
                 if remove_entry(&mut entry.children, path) {
                     return true;
                 }
             }
-
             false
         }
-
         remove_entry(&mut self.entries, path)
     }
 
     pub fn mark_deleted(&mut self, path: &Path) {
         self.deleted_paths.insert(path.to_path_buf());
-        self.expanded_paths
-            .retain(|expanded| !expanded.starts_with(path));
+        self.marks.remove(path);
     }
 
-    fn get_entry_mut_by_path(&mut self, path: &Path) -> Option<&mut FileEntry> {
-        fn find_entry_mut<'a>(
-            entries: &'a mut [FileEntry],
+    /// Update an entry's classification in-place.
+    #[allow(dead_code)] // Used by LLM result application
+    pub fn update_entry_classification(
+        &mut self,
+        path: &Path,
+        category: Category,
+        safety: SafetyLevel,
+        reason: String,
+    ) -> bool {
+        fn update(
+            entries: &mut [FileEntry],
             path: &Path,
-        ) -> Option<&'a mut FileEntry> {
+            category: Category,
+            safety: SafetyLevel,
+            reason: &str,
+        ) -> bool {
             for entry in entries {
                 if entry.path == path {
-                    return Some(entry);
+                    entry.category = category;
+                    entry.safety = safety;
+                    entry.safety_reason = reason.to_string();
+                    return true;
                 }
-
-                if let Some(found) = find_entry_mut(&mut entry.children, path) {
-                    return Some(found);
+                if update(&mut entry.children, path, category, safety, reason) {
+                    return true;
                 }
             }
-
-            None
+            false
         }
-
-        find_entry_mut(&mut self.entries, path)
+        update(&mut self.entries, path, category, safety, &reason)
     }
 
-    pub fn rebuild_flat_entries(&mut self) {
-        self.flat_entries.clear();
-        match self.current_view {
-            View::BySize => self.flatten_by_size(),
-            View::ByType => self.flatten_by_group(|e| e.category),
-            View::BySafety => self.flatten_by_group(|e| e.safety),
-            View::ByAge => self.flatten_by_age(),
+    /// Ensure scroll_offset keeps the selected index visible.
+    #[allow(dead_code)] // Used by column rendering in draw path
+    pub fn ensure_visible(&mut self, area_height: u16) {
+        let col = self.columns.current_mut();
+        let h = area_height as usize;
+        if h == 0 {
+            return;
         }
-    }
-
-    fn flatten_by_size(&mut self) {
-        let mut sorted = self.entries.clone();
-        sorted.sort_by_key(|entry| Reverse(entry.total_size(self.size_mode())));
-
-        for entry in &sorted {
-            self.flatten_entry(entry, 0);
-        }
-    }
-
-    fn flatten_entry(&mut self, entry: &FileEntry, depth: usize) {
-        self.flat_entries.push(FlatEntry {
-            depth,
-            path: entry.path.clone(),
-            size: entry.total_size(self.size_mode()),
-            logical_size: entry.total_size(SizeMode::Logical),
-            physical_size: entry.total_size(SizeMode::Physical),
-            is_dir: entry.is_dir,
-            expanded: entry.expanded,
-            modified: entry.modified,
-            category: entry.category,
-            safety: entry.safety,
-            safety_reason: entry.safety_reason.clone(),
-        });
-
-        if entry.expanded {
-            let mut children: Vec<&FileEntry> = entry.children.iter().collect();
-            children.sort_by_key(|entry| Reverse(entry.total_size(self.size_mode())));
-
-            for child in children {
-                self.flatten_entry(child, depth + 1);
-            }
-        }
-    }
-
-    fn flatten_by_group<K: Ord + std::fmt::Display, F: Fn(&FlatEntry) -> K>(&mut self, key_fn: F) {
-        let mut all_flat = Vec::new();
-        let sorted = {
-            let mut s = self.entries.clone();
-            s.sort_by_key(|entry| Reverse(entry.total_size(self.size_mode())));
-            s
-        };
-        for entry in &sorted {
-            Self::collect_flat(entry, 0, self.size_mode(), &mut all_flat);
-        }
-
-        all_flat.sort_by(|a, b| {
-            let ka = key_fn(a);
-            let kb = key_fn(b);
-            ka.cmp(&kb).then(b.size.cmp(&a.size))
-        });
-
-        self.flat_entries = all_flat;
-    }
-
-    fn flatten_by_age(&mut self) {
-        let mut all_flat = Vec::new();
-        for entry in &self.entries {
-            Self::collect_flat(entry, 0, self.size_mode(), &mut all_flat);
-        }
-
-        all_flat.sort_by(|a, b| match (a.modified, b.modified) {
-            (Some(a_modified), Some(b_modified)) => {
-                a_modified.cmp(&b_modified).then(b.size.cmp(&a.size))
-            }
-            (Some(_), None) => Ordering::Less,
-            (None, Some(_)) => Ordering::Greater,
-            (None, None) => b.size.cmp(&a.size),
-        });
-
-        self.flat_entries = all_flat;
-    }
-
-    fn collect_flat(
-        entry: &FileEntry,
-        depth: usize,
-        size_mode: SizeMode,
-        out: &mut Vec<FlatEntry>,
-    ) {
-        out.push(FlatEntry {
-            depth,
-            path: entry.path.clone(),
-            size: entry.total_size(size_mode),
-            logical_size: entry.total_size(SizeMode::Logical),
-            physical_size: entry.total_size(SizeMode::Physical),
-            is_dir: entry.is_dir,
-            expanded: entry.expanded,
-            modified: entry.modified,
-            category: entry.category,
-            safety: entry.safety,
-            safety_reason: entry.safety_reason.clone(),
-        });
-
-        for child in &entry.children {
-            Self::collect_flat(child, depth + 1, size_mode, out);
+        if col.selected_index < col.scroll_offset {
+            col.scroll_offset = col.selected_index;
+        } else if col.selected_index >= col.scroll_offset + h {
+            col.scroll_offset = col.selected_index.saturating_sub(h - 1);
         }
     }
 }
@@ -562,166 +423,102 @@ fn build_dir_picker_options() -> Vec<PathBuf> {
 mod tests {
     use super::*;
     use crate::config::AppConfig;
-    use purifier_core::size::EntrySizes;
-    use std::time::{Duration, SystemTime};
+    use purifier_core::provider::ProviderKind;
+    use std::path::PathBuf;
 
-    fn dir(path: &str, size: u64) -> FileEntry {
-        FileEntry::new(PathBuf::from(path), size, true, None)
+    fn dir(path: &str, children: Vec<FileEntry>) -> FileEntry {
+        let mut entry = FileEntry::new(PathBuf::from(path), 0, true, None);
+        entry.children = children;
+        entry
     }
 
-    fn file(path: &str, size: u64, modified: Option<SystemTime>) -> FileEntry {
-        FileEntry::new(PathBuf::from(path), size, false, modified)
+    fn file(path: &str, size: u64) -> FileEntry {
+        FileEntry::new(PathBuf::from(path), size, false, None)
     }
 
     #[test]
-    fn toggle_expand_should_target_selected_path_when_entries_are_size_sorted() {
+    fn start_scan_with_path_should_record_last_scan_path_for_persistence() {
         let mut app = App::new(Some(PathBuf::from("/")), false, AppConfig::default());
-        app.entries = vec![dir("/small", 10), dir("/large", 20)];
-        app.rebuild_flat_entries();
+
+        app.start_scan_with_path(PathBuf::from("/tmp/project"));
 
         assert_eq!(
-            app.selected_entry().map(|entry| entry.path.as_path()),
-            Some(PathBuf::from("/large").as_path())
+            app.preferences.ui.last_scan_path,
+            Some(PathBuf::from("/tmp/project"))
         );
-
-        app.toggle_expand();
-
-        assert!(!app.entries[0].expanded, "small should stay collapsed");
-        assert!(app.entries[1].expanded, "large should expand");
     }
 
     #[test]
-    fn remove_entry_by_path_should_remove_selected_path_when_entries_are_size_sorted() {
-        let mut app = App::new(Some(PathBuf::from("/")), false, AppConfig::default());
-        app.entries = vec![dir("/small", 10), dir("/large", 20)];
-        app.rebuild_flat_entries();
+    fn onboarding_should_default_to_openrouter_when_no_provider_is_configured() {
+        let mut app = App::new(Some(PathBuf::from("/")), true, AppConfig::default());
+        app.open_onboarding();
 
-        let selected_path = app
-            .selected_entry()
-            .map(|entry| entry.path.clone())
-            .expect("selected entry should exist");
-
-        assert!(app.remove_entry_by_path(&selected_path));
-        assert_eq!(app.entries.len(), 1, "one entry should remain");
-        assert_eq!(app.entries[0].path, PathBuf::from("/small"));
+        match &app.preview_mode {
+            PreviewMode::Onboarding(draft) => {
+                assert_eq!(draft.provider, ProviderKind::OpenRouter)
+            }
+            other => panic!("expected onboarding preview, got {other:?}"),
+        }
     }
 
     #[test]
-    fn age_view_should_sort_oldest_first_and_put_missing_timestamps_last() {
-        let older = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
-        let newer = SystemTime::UNIX_EPOCH + Duration::from_secs(20);
+    fn children_at_path_returns_top_level_entries_for_scan_root() {
         let mut app = App::new(Some(PathBuf::from("/")), false, AppConfig::default());
         app.entries = vec![
-            file("/none", 5, None),
-            file("/newer", 5, Some(newer)),
-            file("/older", 5, Some(older)),
+            file("/a", 10),
+            file("/b", 20),
         ];
 
-        app.switch_view(View::ByAge);
-
-        let paths: Vec<PathBuf> = app
-            .flat_entries
-            .iter()
-            .map(|entry| entry.path.clone())
-            .collect();
-        assert_eq!(
-            paths,
-            vec![
-                PathBuf::from("/older"),
-                PathBuf::from("/newer"),
-                PathBuf::from("/none"),
-            ]
-        );
+        let children = app.children_at_path(Path::new("/")).unwrap();
+        assert_eq!(children.len(), 2);
     }
 
     #[test]
-    fn age_view_should_use_size_as_tiebreaker_for_matching_timestamps() {
-        let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+    fn children_at_path_returns_nested_children() {
         let mut app = App::new(Some(PathBuf::from("/")), false, AppConfig::default());
-        app.entries = vec![
-            file("/small", 10, Some(modified)),
-            file("/large", 20, Some(modified)),
-        ];
+        app.entries = vec![dir(
+            "/root",
+            vec![file("/root/a", 10), file("/root/b", 20)],
+        )];
 
-        app.switch_view(View::ByAge);
-
-        let paths: Vec<PathBuf> = app
-            .flat_entries
-            .iter()
-            .map(|entry| entry.path.clone())
-            .collect();
-        assert_eq!(
-            paths,
-            vec![PathBuf::from("/large"), PathBuf::from("/small")]
-        );
+        let children = app.children_at_path(Path::new("/root")).unwrap();
+        assert_eq!(children.len(), 2);
     }
 
     #[test]
-    fn size_view_should_sort_by_selected_size_mode() {
-        let entries = vec![
-            FileEntry::new_with_sizes(
-                PathBuf::from("/logical-large"),
-                EntrySizes {
-                    logical_bytes: 20,
-                    physical_bytes: 4096,
-                    accounted_physical_bytes: 4096,
-                },
-                None,
-                false,
-                None,
-            ),
-            FileEntry::new_with_sizes(
-                PathBuf::from("/physical-large"),
-                EntrySizes {
-                    logical_bytes: 10,
-                    physical_bytes: 8192,
-                    accounted_physical_bytes: 8192,
-                },
-                None,
-                false,
-                None,
-            ),
-        ];
+    fn selected_entry_returns_correct_entry() {
+        let mut app = App::new(Some(PathBuf::from("/")), false, AppConfig::default());
+        app.entries = vec![file("/a", 10), file("/b", 30), file("/c", 20)];
+        // Sort by size: b(30), c(20), a(10) — selected_index=0 → b
+        let entry = app.selected_entry().unwrap();
+        assert_eq!(entry.path, PathBuf::from("/b"));
+    }
 
-        let mut logical_config = AppConfig::default();
-        logical_config.ui.size_mode = SizeMode::Logical;
-        let mut logical_app = App::new(Some(PathBuf::from("/")), false, logical_config);
-        logical_app.entries = entries.clone();
-        logical_app.rebuild_flat_entries();
+    #[test]
+    fn update_entry_classification_works() {
+        let mut app = App::new(Some(PathBuf::from("/")), false, AppConfig::default());
+        app.entries = vec![file("/test", 10)];
 
-        let logical_paths: Vec<PathBuf> = logical_app
-            .flat_entries
-            .iter()
-            .map(|entry| entry.path.clone())
-            .collect();
-        assert_eq!(
-            logical_paths,
-            vec![
-                PathBuf::from("/logical-large"),
-                PathBuf::from("/physical-large"),
-            ]
-        );
-        assert_eq!(logical_app.flat_entries[0].size, 20);
+        assert!(app.update_entry_classification(
+            Path::new("/test"),
+            Category::Cache,
+            SafetyLevel::Safe,
+            "test cache".to_string(),
+        ));
 
-        let mut physical_config = AppConfig::default();
-        physical_config.ui.size_mode = SizeMode::Physical;
-        let mut physical_app = App::new(Some(PathBuf::from("/")), false, physical_config);
-        physical_app.entries = entries;
-        physical_app.rebuild_flat_entries();
+        let entry = app.entry_at_path(Path::new("/test")).unwrap();
+        assert_eq!(entry.category, Category::Cache);
+        assert_eq!(entry.safety, SafetyLevel::Safe);
+    }
 
-        let physical_paths: Vec<PathBuf> = physical_app
-            .flat_entries
-            .iter()
-            .map(|entry| entry.path.clone())
-            .collect();
-        assert_eq!(
-            physical_paths,
-            vec![
-                PathBuf::from("/physical-large"),
-                PathBuf::from("/logical-large"),
-            ]
-        );
-        assert_eq!(physical_app.flat_entries[0].size, 8192);
+    #[test]
+    fn remove_entry_by_path_removes_from_tree() {
+        let mut app = App::new(Some(PathBuf::from("/")), false, AppConfig::default());
+        app.entries = vec![file("/a", 10), file("/b", 20)];
+
+        assert!(app.remove_entry_by_path(Path::new("/a")));
+        assert_eq!(app.entries.len(), 1);
+        assert_eq!(app.entries[0].path, PathBuf::from("/b"));
     }
 
     #[test]
@@ -738,9 +535,11 @@ mod tests {
 
         app.open_settings();
 
-        let Some(AppModal::Settings(draft)) = app.modal.as_ref() else {
-            panic!("settings modal should open");
-        };
-        assert_eq!(draft.selected_scan_profile, None);
+        match &app.preview_mode {
+            PreviewMode::Settings(draft) => {
+                assert_eq!(draft.selected_scan_profile, None);
+            }
+            _ => panic!("expected settings preview"),
+        }
     }
 }
