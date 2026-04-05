@@ -34,7 +34,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
 }
 
 fn draw_main(frame: &mut Frame, app: &App) {
-    let layout = miller_layout(frame.area());
+    let has_parent = app.columns.parent().is_some();
+    let layout = miller_layout(frame.area(), has_parent);
 
     // Sort indicator row
     columns_view::render_sort_indicator(frame, layout.sort_indicator, app);
@@ -53,7 +54,7 @@ fn draw_main(frame: &mut Frame, app: &App) {
     }
 }
 
-pub fn miller_layout(area: Rect) -> MillerLayout {
+pub fn miller_layout(area: Rect, has_parent: bool) -> MillerLayout {
     // Vertical split: sort indicator (1) | columns area | status bar (1)
     let vertical = Layout::default()
         .direction(Direction::Vertical)
@@ -64,22 +65,42 @@ pub fn miller_layout(area: Rect) -> MillerLayout {
         ])
         .split(area);
 
-    // Horizontal split of the columns area: parent | current | preview
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Ratio(1, 4), // parent ~25%
-            Constraint::Ratio(1, 3), // current ~33%
-            Constraint::Ratio(5, 12), // preview ~42%
-        ])
-        .split(vertical[1]);
+    if has_parent {
+        // Three-pane: parent | current | preview
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Ratio(1, 5),  // parent ~20%
+                Constraint::Ratio(2, 5),  // current ~40%
+                Constraint::Ratio(2, 5),  // preview ~40%
+            ])
+            .split(vertical[1]);
 
-    MillerLayout {
-        sort_indicator: vertical[0],
-        parent_column: columns[0],
-        current_column: columns[1],
-        preview: columns[2],
-        status: vertical[2],
+        MillerLayout {
+            sort_indicator: vertical[0],
+            parent_column: columns[0],
+            current_column: columns[1],
+            preview: columns[2],
+            status: vertical[2],
+        }
+    } else {
+        // Two-pane: current | preview (no parent at root)
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(0),    // no parent
+                Constraint::Ratio(1, 2), // current ~50%
+                Constraint::Ratio(1, 2), // preview ~50%
+            ])
+            .split(vertical[1]);
+
+        MillerLayout {
+            sort_indicator: vertical[0],
+            parent_column: columns[0],
+            current_column: columns[1],
+            preview: columns[2],
+            status: vertical[2],
+        }
     }
 }
 

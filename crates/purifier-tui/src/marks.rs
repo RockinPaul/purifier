@@ -43,6 +43,7 @@ impl MarkSet {
     }
 
     /// Sum sizes of all marked entries by walking the entry tree.
+    #[allow(dead_code)] // Used in tests; UI uses cached_size instead
     pub fn total_size(&self, entries: &[FileEntry], mode: SizeMode) -> u64 {
         self.marked
             .iter()
@@ -62,6 +63,7 @@ impl MarkSet {
     }
 }
 
+#[allow(dead_code)]
 fn find_entry_size(entries: &[FileEntry], path: &Path, mode: SizeMode) -> Option<u64> {
     for entry in entries {
         if entry.path == path {

@@ -33,7 +33,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             format!(
                 "{} marked · {}",
                 app.marks.count(),
-                format_size(app.marks.total_size(&app.entries, app.size_mode()))
+                format_size(app.marks.paths().iter().map(|p| app.cached_size(p, app.size_mode())).sum::<u64>())
             ),
             Style::default().fg(Color::Red),
         ));

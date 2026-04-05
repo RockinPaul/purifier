@@ -236,6 +236,7 @@ fn execute_single_delete(app: &mut App, path: &std::path::Path) {
             app.last_error = None;
             app.mark_deleted(path);
             app.remove_entry_by_path(path);
+            app.rebuild_size_cache();
             // Adjust selection if it's now out of bounds
             let count = app.current_children_count();
             if count > 0 && app.columns.current().selected_index >= count {
@@ -587,6 +588,7 @@ mod tests {
             },
             FileEntry::new(PathBuf::from("/small"), 10, false, None),
         ];
+        app.rebuild_size_cache();
         app
     }
 

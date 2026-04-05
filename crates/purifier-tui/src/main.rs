@@ -272,83 +272,12 @@ fn run_loop(
     let mut buffered_llm_results: Vec<LlmClassification> = Vec::new();
 
     loop {
-        terminal.draw(|frame| ui::draw(frame, app))?;
-
-        // Process scan updates — capped per frame to keep input responsive.
-        let mut scan_completed = false;
-        if let Some(rx) = scan_rx.as_ref() {
-            let mut processed = 0;
-            while processed < MAX_EVENTS_PER_FRAME {
-                match rx.updates.try_recv() {
-                    Ok(event) => {
-                        match event {
-                            ScanProcessingUpdate::UnknownBatch(batch) => {
-                                if let Some(tx) = unknown_tx.as_ref() {
-                                    let _ = tx.send(batch);
-                                } else {
-                                    buffered_unknown_batches.push(batch);
-                                }
-                            }
-                            other => {
-                                if apply_scan_update(app, other) {
-                                    if !buffered_llm_results.is_empty() {
-                                        apply_llm_results(
-                                            app,
-                                            std::mem::take(&mut buffered_llm_results),
-                                        );
-                                    }
-                                    if unknown_tx.is_none() && !should_mark_unknowns_pending(app) {
-                                        buffered_unknown_batches.clear();
-                                        reset_pending_llm_labels_in_state(app);
-                                    }
-                                    scan_completed = true;
-                                }
-                            }
-                        }
-                        processed += 1;
-                    }
-                    Err(_) => break, // channel empty or disconnected
-                }
-            }
-        }
-
-        if scan_completed {
-            *scan_rx = None;
-        }
-
-        if let Some(result_rx) = llm_result_rx.as_ref() {
-            while let Ok(results) = result_rx.try_recv() {
-                if app.scan_status == ScanStatus::Scanning && app.entries.is_empty() {
-                    buffered_llm_results.extend(results);
-                } else {
-                    apply_llm_results(app, results);
-                }
-            }
-        }
-
-        let connection_event = runtime_connection_rx
-            .as_ref()
-            .and_then(|connection_rx| connection_rx.try_recv().ok());
-        if let Some(event) = connection_event {
-            apply_runtime_connection_event(app, classifier, event);
-            *runtime_connection_rx = None;
-            (unknown_tx, llm_result_rx) = start_llm_processing(classifier, app);
-            if unknown_tx.is_some() {
-                flush_unknown_batches(&mut buffered_unknown_batches, unknown_tx.as_ref());
-                requeue_unknown_entries_for_visible_tree(app, unknown_tx.as_ref());
-            } else {
-                buffered_unknown_batches.clear();
-                reset_pending_llm_labels_in_state(app);
-            }
-        }
-
-        // Handle input — always polled every frame
-        if event::poll(Duration::from_millis(50))? {
+        // 1. Drain ALL pending input events before draw — guarantees quit always works.
+        while event::poll(Duration::from_millis(0))? {
             match event::read()? {
                 Event::Key(key) => {
                     match input::handle_key(app, key) {
                         InputResult::StartScan(path) => {
-                            // User selected a directory from picker — start scanning
                             let path = normalize_scan_path(&path);
                             app.scan_path = path.clone();
                             let scan_profile = app.preferences.active_scan_profile().cloned();
@@ -426,6 +355,80 @@ fn run_loop(
                 _ => {}
             }
         }
+
+        // 2. Process scan updates — capped per frame.
+        let mut scan_completed = false;
+        if let Some(rx) = scan_rx.as_ref() {
+            let mut processed = 0;
+            while processed < MAX_EVENTS_PER_FRAME {
+                match rx.updates.try_recv() {
+                    Ok(event) => {
+                        match event {
+                            ScanProcessingUpdate::UnknownBatch(batch) => {
+                                if let Some(tx) = unknown_tx.as_ref() {
+                                    let _ = tx.send(batch);
+                                } else {
+                                    buffered_unknown_batches.push(batch);
+                                }
+                            }
+                            other => {
+                                if apply_scan_update(app, other) {
+                                    if !buffered_llm_results.is_empty() {
+                                        apply_llm_results(
+                                            app,
+                                            std::mem::take(&mut buffered_llm_results),
+                                        );
+                                    }
+                                    if unknown_tx.is_none() && !should_mark_unknowns_pending(app) {
+                                        buffered_unknown_batches.clear();
+                                        reset_pending_llm_labels_in_state(app);
+                                    }
+                                    scan_completed = true;
+                                }
+                            }
+                        }
+                        processed += 1;
+                    }
+                    Err(_) => break, // channel empty or disconnected
+                }
+            }
+        }
+
+        if scan_completed {
+            *scan_rx = None;
+        }
+
+        if let Some(result_rx) = llm_result_rx.as_ref() {
+            while let Ok(results) = result_rx.try_recv() {
+                if app.scan_status == ScanStatus::Scanning && app.entries.is_empty() {
+                    buffered_llm_results.extend(results);
+                } else {
+                    apply_llm_results(app, results);
+                }
+            }
+        }
+
+        let connection_event = runtime_connection_rx
+            .as_ref()
+            .and_then(|connection_rx| connection_rx.try_recv().ok());
+        if let Some(event) = connection_event {
+            apply_runtime_connection_event(app, classifier, event);
+            *runtime_connection_rx = None;
+            (unknown_tx, llm_result_rx) = start_llm_processing(classifier, app);
+            if unknown_tx.is_some() {
+                flush_unknown_batches(&mut buffered_unknown_batches, unknown_tx.as_ref());
+                requeue_unknown_entries_for_visible_tree(app, unknown_tx.as_ref());
+            } else {
+                buffered_unknown_batches.clear();
+                reset_pending_llm_labels_in_state(app);
+            }
+        }
+
+        // 3. Draw frame
+        terminal.draw(|frame| ui::draw(frame, app))?;
+
+        // 4. Wait briefly for next event (16ms ≈ 60fps)
+        let _ = event::poll(Duration::from_millis(16));
     }
 }
 
@@ -1227,6 +1230,7 @@ fn apply_scan_update(app: &mut App, update: ScanProcessingUpdate) -> bool {
             app.total_files = result.total_entries;
             app.skipped = result.skipped;
             app.entries = result.entries;
+            app.rebuild_size_cache();
             true
         }
     }

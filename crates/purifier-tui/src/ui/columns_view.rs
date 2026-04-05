@@ -5,7 +5,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::app::{App, PreviewMode};
-use crate::columns::sorted_children;
+use crate::columns::sorted_children_cached;
 use crate::ui::format_size;
 
 use purifier_core::types::SafetyLevel;
@@ -73,7 +73,10 @@ pub fn render_parent_column(frame: &mut Frame, area: Rect, app: &App) {
         None => return,
     };
 
-    let sorted = sorted_children(children, app.columns.sort_key, app.size_mode());
+    let mode = app.size_mode();
+    let sorted = sorted_children_cached(children, app.columns.sort_key, |e| {
+        app.cached_size(&e.path, mode)
+    });
     let current_dir_path = app.columns.current_path();
 
     // Reserve one row for the directory name header.
@@ -111,7 +114,7 @@ pub fn render_parent_column(frame: &mut Frame, area: Rect, app: &App) {
         .map(|&idx| {
             let entry = &children[idx];
             let name = file_display_name(&entry.path, entry.is_dir);
-            let size_str = format_size(entry.total_size(app.size_mode()));
+            let size_str = format_size(app.cached_size(&entry.path, app.size_mode()));
             let is_current = entry.path == current_dir_path;
 
             if dimmed {
@@ -187,7 +190,10 @@ pub fn render_current_column(frame: &mut Frame, area: Rect, app: &App) {
         None => return,
     };
 
-    let sorted = sorted_children(children, app.columns.sort_key, app.size_mode());
+    let mode = app.size_mode();
+    let sorted = sorted_children_cached(children, app.columns.sort_key, |e| {
+        app.cached_size(&e.path, mode)
+    });
 
     // Reserve one row for the directory name header.
     let header_area = Rect {
@@ -242,7 +248,7 @@ pub fn render_current_column(frame: &mut Frame, area: Rect, app: &App) {
             let is_selected = absolute_row == col.selected_index;
 
             let name = file_display_name(&entry.path, entry.is_dir);
-            let size_str = format_size(entry.total_size(app.size_mode()));
+            let size_str = format_size(app.cached_size(&entry.path, app.size_mode()));
             let is_marked = app.marks.is_marked(&entry.path);
 
             if dimmed {
@@ -336,6 +342,7 @@ mod tests {
         let mut app = App::new(Some(PathBuf::from("/")), false, AppConfig::default());
         app.entries = entries;
         app.scan_status = ScanStatus::Complete;
+        app.rebuild_size_cache();
         app
     }
 

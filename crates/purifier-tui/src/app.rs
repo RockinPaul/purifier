@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use purifier_core::provider::{default_provider_settings, ProviderKind};
@@ -6,7 +6,7 @@ use purifier_core::size::SizeMode;
 use purifier_core::types::{Category, FileEntry, SafetyLevel};
 use purifier_core::DeleteOutcome;
 
-use crate::columns::{find_children, find_entry, sorted_children, ColumnStack};
+use crate::columns::{find_children, find_entry, sorted_children_cached, ColumnStack};
 use crate::config::AppConfig;
 use crate::marks::MarkSet;
 
@@ -97,6 +97,9 @@ pub struct App {
     // LLM classification tracking
     pub llm_classified_count: u64,
     pub llm_pending_count: u64,
+    // Precomputed total sizes: path → (logical_total, physical_total)
+    // Populated once after scan completes. O(1) lookup instead of O(subtree).
+    pub size_cache: HashMap<PathBuf, (u64, u64)>,
     // Batch review scroll position
     pub batch_review_selected: usize,
     // Directory picker
@@ -158,6 +161,7 @@ impl App {
             applied_scan_profile_name: None,
             llm_classified_count: 0,
             llm_pending_count: 0,
+            size_cache: HashMap::new(),
             batch_review_selected: 0,
             dir_picker_options,
             dir_picker_selected: 0,
@@ -278,6 +282,29 @@ impl App {
         };
     }
 
+    // -- Size cache --
+
+    /// Walk the entry tree once and cache total sizes for every node.
+    /// Call after scan completes or after deletion changes the tree.
+    pub fn rebuild_size_cache(&mut self) {
+        self.size_cache.clear();
+        for entry in &self.entries {
+            cache_entry_sizes(entry, &mut self.size_cache);
+        }
+    }
+
+    /// O(1) cached total size for a path. Falls back to entry's own size if not cached.
+    pub fn cached_size(&self, path: &Path, mode: SizeMode) -> u64 {
+        if let Some(&(logical, physical)) = self.size_cache.get(path) {
+            match mode {
+                SizeMode::Logical => logical,
+                SizeMode::Physical => physical,
+            }
+        } else {
+            0
+        }
+    }
+
     // -- Column navigation helpers --
 
     /// Get the children of the directory at `path` in the entry tree.
@@ -298,7 +325,17 @@ impl App {
     pub fn selected_entry(&self) -> Option<&FileEntry> {
         let col = self.columns.current();
         let children = self.children_at_path(&col.path)?;
-        let sorted = sorted_children(children, self.columns.sort_key, self.size_mode());
+        let cache = &self.size_cache;
+        let mode = self.size_mode();
+        let sorted = sorted_children_cached(children, self.columns.sort_key, |e| {
+            cache
+                .get(&e.path)
+                .map(|&(l, p)| match mode {
+                    SizeMode::Logical => l,
+                    SizeMode::Physical => p,
+                })
+                .unwrap_or(0)
+        });
         let idx = sorted.get(col.selected_index)?;
         children.get(*idx)
     }
@@ -391,6 +428,25 @@ impl App {
         } else if col.selected_index >= col.scroll_offset + h {
             col.scroll_offset = col.selected_index.saturating_sub(h - 1);
         }
+    }
+}
+
+/// Recursively cache total sizes for an entry and all descendants. Returns (logical, physical).
+fn cache_entry_sizes(entry: &FileEntry, cache: &mut HashMap<PathBuf, (u64, u64)>) -> (u64, u64) {
+    if entry.children.is_empty() {
+        let logical = entry.sizes.accounted_total_bytes(SizeMode::Logical);
+        let physical = entry.sizes.accounted_total_bytes(SizeMode::Physical);
+        cache.insert(entry.path.clone(), (logical, physical));
+        (logical, physical)
+    } else {
+        let (mut total_logical, mut total_physical) = (0u64, 0u64);
+        for child in &entry.children {
+            let (cl, cp) = cache_entry_sizes(child, cache);
+            total_logical += cl;
+            total_physical += cp;
+        }
+        cache.insert(entry.path.clone(), (total_logical, total_physical));
+        (total_logical, total_physical)
     }
 }
 
@@ -489,6 +545,7 @@ mod tests {
     fn selected_entry_returns_correct_entry() {
         let mut app = App::new(Some(PathBuf::from("/")), false, AppConfig::default());
         app.entries = vec![file("/a", 10), file("/b", 30), file("/c", 20)];
+        app.rebuild_size_cache();
         // Sort by size: b(30), c(20), a(10) — selected_index=0 → b
         let entry = app.selected_entry().unwrap();
         assert_eq!(entry.path, PathBuf::from("/b"));

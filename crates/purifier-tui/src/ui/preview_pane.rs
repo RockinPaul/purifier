@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
@@ -53,7 +54,7 @@ fn render_analytics(frame: &mut Frame, area: Rect, app: &App) {
     if entry.is_dir {
         render_dir_analytics(&mut lines, entry, app, mode);
     } else {
-        render_file_analytics(&mut lines, entry, mode);
+        render_file_analytics(&mut lines, entry, app, mode);
     }
 
     let widget = Paragraph::new(lines).block(
@@ -87,9 +88,9 @@ fn render_dir_analytics(
     lines.push(Line::from(""));
 
     // Size information
-    let logical = entry.total_size(SizeMode::Logical);
-    let physical = entry.total_size(SizeMode::Physical);
-    let display = entry.total_size(mode);
+    let logical = app.cached_size(&entry.path, SizeMode::Logical);
+    let physical = app.cached_size(&entry.path, SizeMode::Physical);
+    let display = app.cached_size(&entry.path, mode);
 
     lines.push(Line::from(vec![
         Span::raw("  Size: "),
@@ -120,7 +121,7 @@ fn render_dir_analytics(
     lines.push(Line::from(""));
 
     // By type
-    let by_category = aggregate_by_category(children, mode);
+    let by_category = aggregate_by_category(children, &app.size_cache, mode);
     if !by_category.is_empty() {
         lines.push(Line::from(Span::styled(
             "  By type",
@@ -185,7 +186,7 @@ fn render_dir_analytics(
     }
 }
 
-fn render_file_analytics(lines: &mut Vec<Line<'static>>, entry: &FileEntry, mode: SizeMode) {
+fn render_file_analytics(lines: &mut Vec<Line<'static>>, entry: &FileEntry, app: &App, mode: SizeMode) {
     // Safety verdict
     let (badge_text, badge_color) = safety_badge(entry.safety);
     lines.push(Line::from(vec![
@@ -203,7 +204,7 @@ fn render_file_analytics(lines: &mut Vec<Line<'static>>, entry: &FileEntry, mode
     lines.push(Line::from(""));
 
     // Size
-    let display = entry.total_size(mode);
+    let display = app.cached_size(&entry.path, mode);
     lines.push(Line::from(vec![
         Span::raw("  Size: "),
         Span::styled(format_size(display), Style::default().fg(Color::Cyan)),
@@ -257,12 +258,12 @@ fn render_delete_confirm(frame: &mut Frame, area: Rect, app: &App, path: PathBuf
 
         lines.push(Line::from(vec![
             Span::raw("  Logical size: "),
-            Span::raw(format_size(entry.total_size(SizeMode::Logical))),
+            Span::raw(format_size(app.cached_size(&entry.path, SizeMode::Logical))),
         ]));
 
         lines.push(Line::from(vec![
             Span::raw("  Est. physical freed: "),
-            Span::raw(format_size(entry.total_size(SizeMode::Physical))),
+            Span::raw(format_size(app.cached_size(&entry.path, SizeMode::Physical))),
         ]));
 
         lines.push(Line::from(vec![
@@ -331,7 +332,7 @@ fn render_batch_review(frame: &mut Frame, area: Rect, app: &App) {
     for (i, path) in visible {
         let entry = find_entry(&app.entries, path);
         let size_str = entry
-            .map(|e| format_size(e.total_size(mode)))
+            .map(|e| format_size(app.cached_size(&e.path, mode)))
             .unwrap_or_else(|| "?".to_string());
         let (badge, color) = entry
             .map(|e| safety_badge(e.safety))
@@ -360,8 +361,8 @@ fn render_batch_review(frame: &mut Frame, area: Rect, app: &App) {
     lines.push(Line::from(""));
 
     // Totals
-    let total_logical = app.marks.total_size(&app.entries, SizeMode::Logical);
-    let total_physical = app.marks.total_size(&app.entries, SizeMode::Physical);
+    let total_logical: u64 = app.marks.paths().iter().map(|p| app.cached_size(p, SizeMode::Logical)).sum();
+    let total_physical: u64 = app.marks.paths().iter().map(|p| app.cached_size(p, SizeMode::Physical)).sum();
 
     lines.push(Line::from(vec![
         Span::styled("  Total logical: ", Style::default().fg(Color::DarkGray)),
@@ -665,11 +666,11 @@ fn relative_time(time: SystemTime) -> String {
 }
 
 /// Aggregate children sizes by `Category`, sorted by size descending.
-pub fn aggregate_by_category(children: &[FileEntry], mode: SizeMode) -> Vec<(Category, u64)> {
+pub fn aggregate_by_category(children: &[FileEntry], cache: &HashMap<PathBuf, (u64, u64)>, mode: SizeMode) -> Vec<(Category, u64)> {
     let mut map: Vec<(Category, u64)> = Vec::new();
 
     for child in children {
-        let size = child.total_size(mode);
+        let size = cache.get(&child.path).map(|&(l, p)| match mode { SizeMode::Logical => l, SizeMode::Physical => p }).unwrap_or(0);
         if let Some(entry) = map.iter_mut().find(|(c, _)| *c == child.category) {
             entry.1 += size;
         } else {
@@ -743,6 +744,12 @@ mod tests {
         entry
     }
 
+    fn build_cache(entries: &[FileEntry]) -> HashMap<PathBuf, (u64, u64)> {
+        entries.iter().map(|e| {
+            (e.path.clone(), (e.sizes.logical_bytes, e.sizes.physical_bytes))
+        }).collect()
+    }
+
     // -- aggregate_by_category tests --
 
     #[test]
@@ -752,8 +759,9 @@ mod tests {
             make_file("/b", 200, Category::Cache, None),
             make_file("/c", 50, Category::Media, None),
         ];
+        let cache = build_cache(&children);
 
-        let result = aggregate_by_category(&children, SizeMode::Logical);
+        let result = aggregate_by_category(&children, &cache, SizeMode::Logical);
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0], (Category::Cache, 300));
@@ -767,8 +775,9 @@ mod tests {
             make_file("/b", 500, Category::Download, None),
             make_file("/c", 200, Category::BuildArtifact, None),
         ];
+        let cache = build_cache(&children);
 
-        let result = aggregate_by_category(&children, SizeMode::Logical);
+        let result = aggregate_by_category(&children, &cache, SizeMode::Logical);
 
         assert_eq!(result[0].0, Category::Download);
         assert_eq!(result[1].0, Category::BuildArtifact);
@@ -777,7 +786,8 @@ mod tests {
 
     #[test]
     fn aggregate_by_category_should_return_empty_for_no_children() {
-        let result = aggregate_by_category(&[], SizeMode::Logical);
+        let cache = HashMap::new();
+        let result = aggregate_by_category(&[], &cache, SizeMode::Logical);
         assert!(result.is_empty());
     }
 
@@ -787,8 +797,9 @@ mod tests {
             make_file("/a", 100, Category::AppData, None),
             make_file("/b", 200, Category::AppData, None),
         ];
+        let cache = build_cache(&children);
 
-        let result = aggregate_by_category(&children, SizeMode::Logical);
+        let result = aggregate_by_category(&children, &cache, SizeMode::Logical);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], (Category::AppData, 300));
@@ -809,8 +820,10 @@ mod tests {
         );
         entry.category = Category::Cache;
 
-        let logical = aggregate_by_category(&[entry.clone()], SizeMode::Logical);
-        let physical = aggregate_by_category(&[entry], SizeMode::Physical);
+        let cache_logical = build_cache(&[entry.clone()]);
+        let logical = aggregate_by_category(&[entry.clone()], &cache_logical, SizeMode::Logical);
+        let cache_physical = build_cache(&[entry.clone()]);
+        let physical = aggregate_by_category(&[entry], &cache_physical, SizeMode::Physical);
 
         assert_eq!(logical[0].1, 100);
         assert_eq!(physical[0].1, 4096);

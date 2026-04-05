@@ -152,7 +152,9 @@ impl ColumnStack {
                 let next = current.join(component);
                 // Find the entry in current directory's children and select it
                 if let Some(children) = find_children(entries, &current) {
-                    let sorted = sorted_children(children, self.sort_key, size_mode);
+                    let sorted = sorted_children_cached(children, self.sort_key, |e| {
+                        e.total_size(size_mode)
+                    });
                     if let Some(pos) = sorted
                         .iter()
                         .position(|&idx| children[idx].path == next)
@@ -170,41 +172,36 @@ impl ColumnStack {
 }
 
 /// Returns sorted indices into `children` based on the given sort key.
-pub fn sorted_children(children: &[FileEntry], sort_key: SortKey, size_mode: SizeMode) -> Vec<usize> {
+/// `size_fn` provides cached O(1) size lookup instead of recursive total_size().
+pub fn sorted_children_cached(
+    children: &[FileEntry],
+    sort_key: SortKey,
+    size_fn: impl Fn(&FileEntry) -> u64,
+) -> Vec<usize> {
+    // Precompute sizes once into a vec so sort comparisons are O(1)
+    let sizes: Vec<u64> = children.iter().map(&size_fn).collect();
     let mut indices: Vec<usize> = (0..children.len()).collect();
 
     match sort_key {
         SortKey::Size => {
-            indices.sort_by(|&a, &b| {
-                let sa = children[a].total_size(size_mode);
-                let sb = children[b].total_size(size_mode);
-                sb.cmp(&sa) // descending
-            });
+            indices.sort_by(|&a, &b| sizes[b].cmp(&sizes[a]));
         }
         SortKey::Safety => {
             indices.sort_by(|&a, &b| {
                 let sa = safety_rank(children[a].safety);
                 let sb = safety_rank(children[b].safety);
-                sa.cmp(&sb).then_with(|| {
-                    children[b]
-                        .total_size(size_mode)
-                        .cmp(&children[a].total_size(size_mode))
-                })
+                sa.cmp(&sb).then_with(|| sizes[b].cmp(&sizes[a]))
             });
         }
         SortKey::Age => {
             indices.sort_by(|&a, &b| {
                 match (children[a].modified, children[b].modified) {
-                    (Some(ma), Some(mb)) => ma.cmp(&mb), // oldest first
+                    (Some(ma), Some(mb)) => ma.cmp(&mb),
                     (Some(_), None) => std::cmp::Ordering::Less,
                     (None, Some(_)) => std::cmp::Ordering::Greater,
                     (None, None) => std::cmp::Ordering::Equal,
                 }
-                .then_with(|| {
-                    children[b]
-                        .total_size(size_mode)
-                        .cmp(&children[a].total_size(size_mode))
-                })
+                .then_with(|| sizes[b].cmp(&sizes[a]))
             });
         }
         SortKey::Name => {
@@ -343,7 +340,7 @@ mod tests {
             make_file("/c", 20, None),
         ];
 
-        let indices = sorted_children(&children, SortKey::Size, SizeMode::Logical);
+        let indices = sorted_children_cached(&children, SortKey::Size, |e| e.total_size(SizeMode::Logical));
         let names: Vec<&str> = indices
             .iter()
             .map(|&i| children[i].path.file_name().unwrap().to_str().unwrap())
@@ -359,7 +356,7 @@ mod tests {
             make_file("/bravo", 15, None),
         ];
 
-        let indices = sorted_children(&children, SortKey::Name, SizeMode::Logical);
+        let indices = sorted_children_cached(&children, SortKey::Name, |e| e.total_size(SizeMode::Logical));
         let names: Vec<&str> = indices
             .iter()
             .map(|&i| children[i].path.file_name().unwrap().to_str().unwrap())
@@ -376,7 +373,7 @@ mod tests {
             make_classified_file("/caution", 15, SafetyLevel::Caution),
         ];
 
-        let indices = sorted_children(&children, SortKey::Safety, SizeMode::Logical);
+        let indices = sorted_children_cached(&children, SortKey::Safety, |e| e.total_size(SizeMode::Logical));
         let names: Vec<&str> = indices
             .iter()
             .map(|&i| children[i].path.file_name().unwrap().to_str().unwrap())
@@ -395,7 +392,7 @@ mod tests {
             make_file("/old", 10, Some(old)),
         ];
 
-        let indices = sorted_children(&children, SortKey::Age, SizeMode::Logical);
+        let indices = sorted_children_cached(&children, SortKey::Age, |e| e.total_size(SizeMode::Logical));
         let names: Vec<&str> = indices
             .iter()
             .map(|&i| children[i].path.file_name().unwrap().to_str().unwrap())
