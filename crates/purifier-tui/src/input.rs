@@ -1,10 +1,12 @@
 use std::path::PathBuf;
 
-use crossterm::event::{KeyCode, KeyEvent, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use purifier_core::provider::{default_provider_settings, ProviderKind};
 use purifier_core::size::SizeMode;
+use ratatui::layout::{Position, Rect};
 
 use crate::app::{App, AppScreen, PreviewMode, ScanStatus, SettingsDraft};
+use crate::ui::miller_layout;
 
 pub enum InputResult {
     None,
@@ -34,13 +36,146 @@ pub fn handle_mouse(app: &mut App, mouse: MouseEvent) {
     if !matches!(app.preview_mode, PreviewMode::Analytics) {
         return;
     }
+    if matches!(app.scan_status, ScanStatus::Scanning) {
+        return;
+    }
 
-    let count = app.current_children_count();
+    let has_parent = app.columns.parent().is_some();
+    let layout = miller_layout(app.terminal_size, has_parent);
+    let pos = Position {
+        x: mouse.column,
+        y: mouse.row,
+    };
+    let list_height = layout.current_column.height.saturating_sub(1); // -1 for header
+
     match mouse.kind {
-        MouseEventKind::ScrollDown => app.columns.move_selection(1, count),
-        MouseEventKind::ScrollUp => app.columns.move_selection(-1, count),
+        // -- Scroll wheel --
+        MouseEventKind::ScrollDown => {
+            if layout.current_column.contains(pos) || layout.parent_column.contains(pos) {
+                let count = app.current_children_count();
+                app.columns.move_selection(1, count);
+                app.ensure_visible(list_height);
+                app.invalidate_preview_cache();
+            }
+        }
+        MouseEventKind::ScrollUp => {
+            if layout.current_column.contains(pos) || layout.parent_column.contains(pos) {
+                let count = app.current_children_count();
+                app.columns.move_selection(-1, count);
+                app.ensure_visible(list_height);
+                app.invalidate_preview_cache();
+            }
+        }
+
+        // -- Horizontal scroll (trackpad swipe) --
+        MouseEventKind::ScrollLeft => {
+            app.columns.back();
+            app.invalidate_preview_cache();
+        }
+        MouseEventKind::ScrollRight => {
+            if let Some(entry) = app.selected_entry() {
+                if entry.is_dir {
+                    let path = entry.path.clone();
+                    app.columns.enter(path);
+                    app.invalidate_preview_cache();
+                }
+            }
+        }
+
+        // -- Left click --
+        MouseEventKind::Down(MouseButton::Left) => {
+            let is_dbl = is_double_click(app, mouse.column, mouse.row);
+            app.last_click = Some((mouse.column, mouse.row, std::time::Instant::now()));
+
+            if layout.current_column.contains(pos) {
+                let scroll_offset = app.columns.current().scroll_offset;
+                if let Some(row) =
+                    click_to_row(layout.current_column, mouse.row, scroll_offset)
+                {
+                    let count = app.current_children_count();
+                    if row < count {
+                        app.columns.current_mut().selected_index = row;
+                        app.ensure_visible(list_height);
+                        app.invalidate_preview_cache();
+
+                        if is_dbl {
+                            if let Some(entry) = app.selected_entry() {
+                                if entry.is_dir {
+                                    let path = entry.path.clone();
+                                    app.columns.enter(path);
+                                    app.invalidate_preview_cache();
+                                } else {
+                                    let path = entry.path.clone();
+                                    app.marks.toggle(&path);
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if layout.parent_column.contains(pos) {
+                app.columns.back();
+                app.invalidate_preview_cache();
+            } else if layout.preview.contains(pos) {
+                if let Some(entry) = app.selected_entry() {
+                    if entry.is_dir {
+                        let path = entry.path.clone();
+                        app.columns.enter(path);
+                        app.invalidate_preview_cache();
+                    }
+                }
+            }
+        }
+
+        // -- Right click: go back --
+        MouseEventKind::Down(MouseButton::Right) => {
+            app.columns.back();
+            app.invalidate_preview_cache();
+        }
+
+        // -- Middle click: toggle mark --
+        MouseEventKind::Down(MouseButton::Middle) => {
+            if layout.current_column.contains(pos) {
+                let scroll_offset = app.columns.current().scroll_offset;
+                if let Some(row) =
+                    click_to_row(layout.current_column, mouse.row, scroll_offset)
+                {
+                    let count = app.current_children_count();
+                    if row < count {
+                        app.columns.current_mut().selected_index = row;
+                        app.ensure_visible(list_height);
+                        if let Some(path) = app.selected_path() {
+                            app.marks.toggle(&path);
+                        }
+                        app.invalidate_preview_cache();
+                    }
+                }
+            }
+        }
+
+        // Ignore Up, Drag, Moved
         _ => {}
     }
+}
+
+const DOUBLE_CLICK_MS: u128 = 400;
+
+fn is_double_click(app: &App, col: u16, row: u16) -> bool {
+    if let Some((prev_col, prev_row, prev_time)) = app.last_click {
+        let elapsed = prev_time.elapsed().as_millis();
+        elapsed < DOUBLE_CLICK_MS && prev_col == col && prev_row == row
+    } else {
+        false
+    }
+}
+
+fn click_to_row(pane: Rect, mouse_row: u16, scroll_offset: usize) -> Option<usize> {
+    let header_height = 1u16;
+    let list_start_y = pane.y + header_height;
+    if mouse_row < list_start_y || mouse_row >= pane.y + pane.height {
+        return None;
+    }
+    let visual_row = (mouse_row - list_start_y) as usize;
+    Some(scroll_offset + visual_row)
 }
 
 // -- Main screen --
@@ -48,6 +183,15 @@ pub fn handle_mouse(app: &mut App, mouse: MouseEvent) {
 fn handle_main(app: &mut App, key: KeyEvent) -> InputResult {
     match &app.preview_mode {
         PreviewMode::Analytics => handle_main_analytics(app, key),
+        PreviewMode::Help => {
+            match key.code {
+                KeyCode::Char('?') | KeyCode::Esc => {
+                    app.preview_mode = PreviewMode::Analytics;
+                }
+                _ => {}
+            }
+            InputResult::None
+        }
         PreviewMode::DeleteConfirm(_) => {
             handle_delete_confirm(app, key);
             InputResult::None
@@ -167,6 +311,11 @@ fn handle_main_analytics(app: &mut App, key: KeyEvent) -> InputResult {
         // Settings
         KeyCode::Char(',') => {
             app.open_settings();
+        }
+
+        // Help overlay
+        KeyCode::Char('?') => {
+            app.preview_mode = PreviewMode::Help;
         }
 
         _ => {}

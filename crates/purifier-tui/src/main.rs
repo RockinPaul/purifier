@@ -427,7 +427,14 @@ fn run_loop(
         // 3. Precompute frame cache (sorted indices + preview analytics)
         app.refresh_frame_cache();
 
-        // 4. Draw frame
+        // 4. Update terminal size for mouse hit-testing
+        let sz = terminal.size()?;
+        app.terminal_size = ratatui::layout::Rect::new(0, 0, sz.width, sz.height);
+
+        // 5. Advance name scroll animation tick
+        app.name_scroll_tick = app.name_scroll_tick.wrapping_add(1);
+
+        // 6. Draw frame
         terminal.draw(|frame| ui::draw(frame, app))?;
 
         // 4. Wait briefly for next event (16ms ≈ 60fps)

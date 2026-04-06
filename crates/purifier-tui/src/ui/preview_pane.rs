@@ -18,7 +18,7 @@ use purifier_core::types::{Category, FileEntry, SafetyLevel};
 /// Main entry point: render the right-most preview pane based on `app.preview_mode`.
 pub fn render_preview(frame: &mut Frame, area: Rect, app: &App) {
     match &app.preview_mode {
-        PreviewMode::Analytics => render_analytics(frame, area, app),
+        PreviewMode::Analytics | PreviewMode::Help => render_analytics(frame, area, app),
         PreviewMode::DeleteConfirm(path) => render_delete_confirm(frame, area, app, path.clone()),
         PreviewMode::BatchReview => render_batch_review(frame, area, app),
         PreviewMode::Settings(draft) => render_settings(frame, area, app, draft, false),
@@ -491,6 +491,33 @@ fn render_settings(
         Span::styled(profile_name.to_string(), Style::default().fg(Color::White)),
         Span::styled("  [p] cycle", Style::default().fg(Color::DarkGray)),
     ]));
+
+    // Gesture mapping reference (settings only, not onboarding)
+    if !is_onboarding {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Mouse & Trackpad",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )));
+        let gesture_hint = Style::default().fg(Color::DarkGray);
+        for (gesture, action) in [
+            ("Left click      ", "Select entry"),
+            ("Double-click    ", "Open dir / mark file"),
+            ("Right click     ", "Go back"),
+            ("Middle click    ", "Toggle mark"),
+            ("Scroll \u{2191}/\u{2193}      ", "Move selection"),
+            ("Swipe \u{2190}/\u{2192}       ", "Navigate back/forward"),
+            ("Click parent    ", "Go to parent dir"),
+            ("Click preview   ", "Enter selected dir"),
+        ] {
+            lines.push(Line::from(vec![
+                Span::styled(format!("    {gesture}"), gesture_hint),
+                Span::raw(action),
+            ]));
+        }
+    }
 
     lines.push(Line::from(""));
 

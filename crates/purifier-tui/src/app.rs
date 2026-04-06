@@ -1,10 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use purifier_core::provider::{default_provider_settings, ProviderKind};
 use purifier_core::size::SizeMode;
 use purifier_core::types::{Category, FileEntry, SafetyLevel};
 use purifier_core::DeleteOutcome;
+
+use ratatui::layout::Rect;
 
 use crate::columns::{find_children, find_entry, sorted_children_cached, ColumnStack};
 use crate::config::AppConfig;
@@ -67,6 +70,8 @@ pub enum PreviewMode {
     Settings(SettingsDraft),
     /// Onboarding form (only used on AppScreen::Onboarding).
     Onboarding(SettingsDraft),
+    /// Help overlay showing all keybindings.
+    Help,
 }
 
 pub struct App {
@@ -120,6 +125,12 @@ pub struct App {
     pub dir_picker_selected: usize,
     pub dir_picker_custom: String,
     pub dir_picker_typing: bool,
+    // Terminal size — updated each frame for mouse hit-testing
+    pub terminal_size: Rect,
+    // Double-click detection: (column, row, timestamp)
+    pub last_click: Option<(u16, u16, Instant)>,
+    // Name scroll animation for long filenames in selected row
+    pub name_scroll_tick: u16,
 }
 
 impl App {
@@ -183,6 +194,9 @@ impl App {
             dir_picker_selected: 0,
             dir_picker_custom: String::new(),
             dir_picker_typing: false,
+            terminal_size: Rect::default(),
+            last_click: None,
+            name_scroll_tick: 0,
         }
     }
 
@@ -315,6 +329,7 @@ impl App {
     pub fn invalidate_preview_cache(&mut self) {
         self.preview_cache = None;
         self.preview_cache_path = None;
+        self.name_scroll_tick = 0;
     }
 
     /// Precompute sorted indices and preview analytics for the current frame.
@@ -534,7 +549,6 @@ impl App {
     }
 
     /// Ensure scroll_offset keeps the selected index visible.
-    #[allow(dead_code)] // Used by column rendering in draw path
     pub fn ensure_visible(&mut self, area_height: u16) {
         let col = self.columns.current_mut();
         let h = area_height as usize;

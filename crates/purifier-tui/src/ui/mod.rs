@@ -1,5 +1,6 @@
 pub mod columns_view;
 pub mod dir_picker;
+pub mod help_overlay;
 pub mod onboarding;
 pub mod preview_pane;
 pub mod status_bar;
@@ -7,7 +8,7 @@ pub mod status_bar;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::Frame;
 
-use crate::app::{App, AppScreen, ScanStatus};
+use crate::app::{App, AppScreen, PreviewMode, ScanStatus};
 
 /// Layout for the main Miller Columns view.
 #[derive(Debug, Clone, Copy)]
@@ -51,6 +52,11 @@ fn draw_main(frame: &mut Frame, app: &App) {
     // If scanning, draw progress overlay on top
     if app.scan_status == ScanStatus::Scanning {
         draw_scanning_overlay(frame, frame.area(), app);
+    }
+
+    // Help overlay on top of everything
+    if matches!(app.preview_mode, PreviewMode::Help) {
+        help_overlay::draw(frame, frame.area());
     }
 }
 

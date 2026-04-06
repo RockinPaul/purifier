@@ -11,51 +11,47 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Ratio(1, 3),
-            Constraint::Ratio(1, 3),
-            Constraint::Ratio(1, 3),
+            Constraint::Percentage(50), // left: breadcrumb + scan info
+            Constraint::Percentage(50), // right: sort + LLM + freed + help
         ])
         .split(area);
 
-    // Left: breadcrumb
+    // Left: breadcrumb + scan/marks info
+    let mut left_parts: Vec<Span<'static>> = Vec::new();
     let breadcrumb = app.columns.breadcrumb();
-    let left = Paragraph::new(Line::from(vec![
-        Span::raw(" "),
-        Span::styled(breadcrumb, Style::default().fg(Color::DarkGray)),
-    ]))
-    .style(Style::default().bg(Color::Black));
-    frame.render_widget(left, chunks[0]);
+    left_parts.push(Span::raw(" "));
+    left_parts.push(Span::styled(
+        breadcrumb,
+        Style::default().fg(Color::DarkGray),
+    ));
 
-    // Center: marks indicator + scan info
-    let mut center_parts = Vec::new();
     if !app.marks.is_empty() {
-        center_parts.push(Span::styled(
+        left_parts.push(Span::styled(
             format!(
-                "{} marked · {}",
+                "  {} marked · {}",
                 app.marks.count(),
                 format_size(app.marks.total_cached_size(&app.size_cache, app.size_mode()))
             ),
             Style::default().fg(Color::Red),
         ));
     } else {
-        // Show scan status in center when no marks
-        center_parts.push(scan_status_span(app));
+        left_parts.push(Span::raw("  "));
+        left_parts.push(scan_status_span(app));
     }
 
     if let Some((message, color)) = notice(app) {
-        center_parts.push(Span::styled(message, Style::default().fg(color)));
+        left_parts.push(Span::styled(message, Style::default().fg(color)));
     }
 
-    let center = Paragraph::new(Line::from(center_parts))
-        .style(Style::default().bg(Color::Black))
-        .alignment(ratatui::layout::Alignment::Center);
-    frame.render_widget(center, chunks[1]);
+    let left = Paragraph::new(Line::from(left_parts))
+        .style(Style::default().bg(Color::Black));
+    frame.render_widget(left, chunks[0]);
 
-    // Right: sort + LLM + help
+    // Right: sort + LLM + freed + help
     let mut right_parts = Vec::new();
 
     right_parts.push(Span::styled(
-        format!("Sort: {} ▼", app.columns.sort_key.label()),
+        format!("Sort: {} \u{25bc}", app.columns.sort_key.label()),
         Style::default().fg(Color::Cyan),
     ));
 
@@ -63,7 +59,10 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
 
     if app.delete_stats.physical_bytes_freed > 0 {
         right_parts.push(Span::styled(
-            format!(" | Freed: {}", format_size(app.delete_stats.physical_bytes_freed)),
+            format!(
+                " | Freed: {}",
+                format_size(app.delete_stats.physical_bytes_freed)
+            ),
             Style::default().fg(Color::Green),
         ));
     } else if app.delete_stats.physical_bytes_estimated > 0 {
@@ -84,7 +83,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     let right = Paragraph::new(Line::from(right_parts))
         .style(Style::default().bg(Color::Black))
         .alignment(ratatui::layout::Alignment::Right);
-    frame.render_widget(right, chunks[2]);
+    frame.render_widget(right, chunks[1]);
 }
 
 fn scan_status_span(app: &App) -> Span<'static> {
@@ -140,7 +139,7 @@ fn llm_status_span(app: &App) -> Span<'static> {
 
 fn help_text(app: &App) -> &'static str {
     if matches!(app.scan_status, ScanStatus::Complete) {
-        " | ,:settings q:quit h/l:nav d:delete "
+        " | j/k:\u{2191}\u{2193} h/l:\u{2190}\u{2192} d:del Space:mark s:switch ,:settings ?:help q:quit "
     } else {
         " | scanning: q/esc:quit "
     }

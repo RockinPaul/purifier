@@ -244,10 +244,16 @@ fn classification_request(
 ) -> ChatRequest {
     ChatRequest {
         model: config.model.clone(),
-        messages: vec![Message {
-            role: "user".to_string(),
-            content: classification_prompt(entries),
-        }],
+        messages: vec![
+            Message {
+                role: "system".to_string(),
+                content: "You are a macOS/Linux filesystem safety classifier for a disk cleanup tool. Your task is to classify file paths by category and safety level. Be conservative: when uncertain, prefer Caution over Safe. Never classify credentials, keys, or git repositories as Safe. Respond with ONLY valid JSON — no markdown, no explanation.".to_string(),
+            },
+            Message {
+                role: "user".to_string(),
+                content: classification_prompt(entries),
+            },
+        ],
         temperature: 0.0,
         max_tokens: None,
     }
