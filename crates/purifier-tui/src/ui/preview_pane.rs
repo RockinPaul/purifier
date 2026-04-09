@@ -10,6 +10,7 @@ use ratatui::Frame;
 
 use crate::app::{App, LlmStatus, PreviewMode, SettingsDraft};
 use crate::columns::find_entry;
+use crate::ui::disclosures::current_storage_and_privacy_lines;
 use crate::ui::format_size;
 use purifier_core::provider::ProviderKind;
 use purifier_core::size::SizeMode;
@@ -422,17 +423,21 @@ fn render_settings(
     )));
     lines.push(Line::from(""));
 
-    // Provider row
-    let providers = [
-        (ProviderKind::OpenRouter, "1:OpenRouter"),
-        (ProviderKind::OpenAI, "2:OpenAI"),
-        (ProviderKind::Anthropic, "3:Anthropic"),
-        (ProviderKind::Google, "4:Google"),
+    // Provider row (only OpenRouter and OpenAI are functional)
+    let providers: &[(ProviderKind, &str, bool)] = &[
+        (ProviderKind::OpenRouter, "1:OpenRouter", true),
+        (ProviderKind::OpenAI, "2:OpenAI", true),
+        (ProviderKind::Anthropic, "Anthropic (soon)", false),
+        (ProviderKind::Google, "Google (soon)", false),
     ];
     let mut provider_spans: Vec<Span<'static>> = vec![Span::raw("  Provider: ")];
-    for (kind, label) in providers {
-        let style = if kind == draft.provider {
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    for &(kind, label, available) in providers {
+        let style = if !available {
+            Style::default().fg(Color::DarkGray)
+        } else if kind == draft.provider {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::DarkGray)
         };
@@ -492,35 +497,6 @@ fn render_settings(
         Span::styled("  [p] cycle", Style::default().fg(Color::DarkGray)),
     ]));
 
-    // Gesture mapping reference (settings only, not onboarding)
-    if !is_onboarding {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "  Mouse & Trackpad",
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )));
-        let gesture_hint = Style::default().fg(Color::DarkGray);
-        for (gesture, action) in [
-            ("Left click      ", "Select entry"),
-            ("Double-click    ", "Open dir / mark file"),
-            ("Right click     ", "Go back"),
-            ("Middle click    ", "Toggle mark"),
-            ("Scroll \u{2191}/\u{2193}      ", "Move selection"),
-            ("Swipe \u{2190}/\u{2192}       ", "Navigate back/forward"),
-            ("Click parent    ", "Go to parent dir"),
-            ("Click preview   ", "Enter selected dir"),
-        ] {
-            lines.push(Line::from(vec![
-                Span::styled(format!("    {gesture}"), gesture_hint),
-                Span::raw(action),
-            ]));
-        }
-    }
-
-    lines.push(Line::from(""));
-
     // LLM status indicator
     let (status_text, status_color) = match &app.llm_status {
         LlmStatus::Disabled => ("LLM: disabled".to_string(), Color::DarkGray),
@@ -551,6 +527,36 @@ fn render_settings(
     }
 
     lines.push(Line::from(""));
+    lines.extend(current_storage_and_privacy_lines());
+    lines.push(Line::from(""));
+
+    // Gesture mapping reference (settings only, not onboarding). Hide it first
+    // on shorter panes so the privacy/storage disclosure remains visible.
+    if !is_onboarding && area.height >= 26 {
+        lines.push(Line::from(Span::styled(
+            "  Mouse & Trackpad",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )));
+        let gesture_hint = Style::default().fg(Color::DarkGray);
+        for (gesture, action) in [
+            ("Left click      ", "Select entry"),
+            ("Double-click    ", "Open dir / mark file"),
+            ("Right click     ", "Go back"),
+            ("Middle click    ", "Toggle mark"),
+            ("Scroll \u{2191}/\u{2193}      ", "Move selection"),
+            ("Swipe \u{2190}/\u{2192}       ", "Navigate back/forward"),
+            ("Click parent    ", "Go to parent dir"),
+            ("Click preview   ", "Enter selected dir"),
+        ] {
+            lines.push(Line::from(vec![
+                Span::styled(format!("    {gesture}"), gesture_hint),
+                Span::raw(action),
+            ]));
+        }
+        lines.push(Line::from(""));
+    }
 
     // Footer
     if is_onboarding {
@@ -759,7 +765,11 @@ pub fn aggregate_by_age(children: &[FileEntry]) -> Vec<(&'static str, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::AppConfig;
     use purifier_core::size::EntrySizes;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::Terminal;
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime};
 
@@ -778,6 +788,28 @@ mod tests {
         entries.iter().map(|e| {
             (e.path.clone(), (e.sizes.logical_bytes, e.sizes.physical_bytes))
         }).collect()
+    }
+
+    fn render_to_buffer(
+        draw_fn: impl FnOnce(&mut Frame),
+        width: u16,
+        height: u16,
+    ) -> Buffer {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal should be created");
+        terminal.draw(draw_fn).expect("should render");
+        terminal.backend().buffer().clone()
+    }
+
+    fn buffer_text(buffer: &Buffer) -> String {
+        let mut text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        text
     }
 
     // -- aggregate_by_category tests --
@@ -1024,6 +1056,35 @@ mod tests {
         };
 
         assert_eq!(api_key_display(&draft), "<not set>");
+    }
+
+    #[test]
+    fn settings_preview_should_explain_plaintext_storage_and_llm_path_sharing() {
+        let mut app = App::new(Some(PathBuf::from("/")), true, AppConfig::default());
+        app.preview_mode = PreviewMode::Settings(SettingsDraft {
+            provider: ProviderKind::OpenRouter,
+            api_key: String::new(),
+            api_key_edited: false,
+            api_key_editing: false,
+            model: "google/gemini-2.0-flash-001".to_string(),
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            llm_enabled: true,
+            size_mode: SizeMode::Physical,
+            selected_scan_profile: None,
+        });
+
+        let area = Rect::new(0, 0, 80, 24);
+        let buffer = render_to_buffer(|frame| render_preview(frame, area, &app), 80, 24);
+        let text = buffer_text(&buffer);
+
+        assert!(
+            text.contains("secrets.toml"),
+            "settings should mention plaintext key storage: {text}"
+        );
+        assert!(
+            text.contains("exact path"),
+            "settings should mention exact path disclosure: {text}"
+        );
     }
 
     // -- safety_badge tests --

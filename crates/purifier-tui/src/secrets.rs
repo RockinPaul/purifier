@@ -1,11 +1,15 @@
 #[cfg(test)]
 use std::collections::HashMap;
 
-use keyring::Entry;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
 use purifier_core::provider::ProviderKind;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 enum SecretOperation {
     Read,
     Write,
@@ -53,29 +57,68 @@ pub trait SecretStore {
     fn delete_api_key(&mut self, provider: ProviderKind) -> Result<(), SecretStoreError>;
 }
 
-pub struct KeychainSecretStore;
+/// File-based secret store. Stores API keys in a TOML file next to the config.
+///
+/// The `keyring` v3 crate on macOS has a bug where `Entry::new()` creates
+/// non-portable credential references that don't survive across process restarts.
+/// This file-based approach is reliable and consistent.
+///
+/// The file is created with restrictive permissions (0600 on Unix).
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct SecretsFile {
+    #[serde(default)]
+    api_keys: BTreeMap<String, String>,
+}
 
-impl KeychainSecretStore {
-    fn entry(
-        provider: ProviderKind,
-        operation: SecretOperation,
-    ) -> Result<Entry, SecretStoreError> {
-        Entry::new("io.github.rockinpaul.purifier", provider.keychain_account())
-            .map_err(|error| secret_store_error(operation, provider, error.to_string()))
+pub struct FileSecretStore {
+    path: PathBuf,
+}
+
+impl FileSecretStore {
+    pub fn new(config_dir: &Path) -> Self {
+        Self {
+            path: config_dir.join("secrets.toml"),
+        }
+    }
+
+    fn read_file(&self) -> SecretsFile {
+        match std::fs::read_to_string(&self.path) {
+            Ok(contents) => toml::from_str(&contents).unwrap_or_default(),
+            Err(_) => SecretsFile::default(),
+        }
+    }
+
+    fn write_file(&self, secrets: &SecretsFile) -> Result<(), String> {
+        // Ensure parent directory exists
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create secrets directory: {e}"))?;
+        }
+
+        let contents =
+            toml::to_string_pretty(secrets).map_err(|e| format!("failed to serialize: {e}"))?;
+        std::fs::write(&self.path, &contents)
+            .map_err(|e| format!("failed to write secrets file: {e}"))?;
+
+        // Set restrictive permissions on Unix
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            let _ = std::fs::set_permissions(&self.path, perms);
+        }
+
+        Ok(())
     }
 }
 
-impl SecretStore for KeychainSecretStore {
+impl SecretStore for FileSecretStore {
     fn load_api_key(&self, provider: ProviderKind) -> Result<Option<String>, SecretStoreError> {
-        match Self::entry(provider, SecretOperation::Read)?.get_password() {
-            Ok(password) => Ok(Some(password)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(error) => Err(secret_store_error(
-                SecretOperation::Read,
-                provider,
-                error.to_string(),
-            )),
-        }
+        let secrets = self.read_file();
+        Ok(secrets
+            .api_keys
+            .get(provider.keychain_account())
+            .cloned())
     }
 
     fn save_api_key(
@@ -83,22 +126,21 @@ impl SecretStore for KeychainSecretStore {
         provider: ProviderKind,
         api_key: &str,
     ) -> Result<(), SecretStoreError> {
-        Self::entry(provider, SecretOperation::Write)?
-            .set_password(api_key)
-            .map_err(|error| {
-                secret_store_error(SecretOperation::Write, provider, error.to_string())
-            })
+        let mut secrets = self.read_file();
+        secrets
+            .api_keys
+            .insert(provider.keychain_account().to_string(), api_key.to_string());
+        self.write_file(&secrets).map_err(|message| {
+            secret_store_error(SecretOperation::Write, provider, message)
+        })
     }
 
     fn delete_api_key(&mut self, provider: ProviderKind) -> Result<(), SecretStoreError> {
-        match Self::entry(provider, SecretOperation::Delete)?.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(error) => Err(secret_store_error(
-                SecretOperation::Delete,
-                provider,
-                error.to_string(),
-            )),
-        }
+        let mut secrets = self.read_file();
+        secrets.api_keys.remove(provider.keychain_account());
+        self.write_file(&secrets).map_err(|message| {
+            secret_store_error(SecretOperation::Delete, provider, message)
+        })
     }
 }
 
@@ -155,6 +197,69 @@ mod tests {
         store.delete_api_key(ProviderKind::OpenAI).unwrap();
 
         assert_eq!(store.load_api_key(ProviderKind::OpenAI).unwrap(), None);
+    }
+
+    #[test]
+    fn file_secret_store_should_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = FileSecretStore::new(dir.path());
+        let test_key = "sk-test-round-trip-12345";
+
+        store
+            .save_api_key(ProviderKind::OpenRouter, test_key)
+            .unwrap();
+
+        // Read back with a NEW store instance (simulates app restart)
+        let store2 = FileSecretStore::new(dir.path());
+        let loaded = store2.load_api_key(ProviderKind::OpenRouter).unwrap();
+        assert_eq!(loaded.as_deref(), Some(test_key));
+    }
+
+    #[test]
+    fn file_secret_store_should_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = FileSecretStore::new(dir.path());
+
+        store
+            .save_api_key(ProviderKind::OpenAI, "sk-delete-me")
+            .unwrap();
+        store.delete_api_key(ProviderKind::OpenAI).unwrap();
+
+        let loaded = store.load_api_key(ProviderKind::OpenAI).unwrap();
+        assert_eq!(loaded, None);
+    }
+
+    #[test]
+    fn file_secret_store_should_handle_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileSecretStore::new(dir.path());
+
+        let loaded = store.load_api_key(ProviderKind::OpenRouter).unwrap();
+        assert_eq!(loaded, None);
+    }
+
+    #[test]
+    fn file_secret_store_should_persist_multiple_providers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = FileSecretStore::new(dir.path());
+
+        store
+            .save_api_key(ProviderKind::OpenRouter, "or-key")
+            .unwrap();
+        store
+            .save_api_key(ProviderKind::OpenAI, "oai-key")
+            .unwrap();
+
+        // New instance
+        let store2 = FileSecretStore::new(dir.path());
+        assert_eq!(
+            store2.load_api_key(ProviderKind::OpenRouter).unwrap(),
+            Some("or-key".to_string())
+        );
+        assert_eq!(
+            store2.load_api_key(ProviderKind::OpenAI).unwrap(),
+            Some("oai-key".to_string())
+        );
     }
 
     #[test]

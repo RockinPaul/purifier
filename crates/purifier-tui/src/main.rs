@@ -32,9 +32,9 @@ use purifier_core::size::SizeMode;
 use purifier_core::types::{FileEntry, SafetyLevel, ScanEvent};
 
 use app::SettingsDraft;
-use app::{App, LlmStatus, ScanStatus};
+use app::{App, LlmStatus, PreviewMode, ScanStatus};
 use input::InputResult;
-use secrets::{KeychainSecretStore, SecretStore};
+use secrets::{FileSecretStore, SecretStore};
 
 /// Max scan events to process per frame to prevent input starvation
 #[cfg_attr(not(test), allow(dead_code))]
@@ -160,7 +160,8 @@ fn main() -> io::Result<()> {
     let config_path = config::default_config_path();
     let saved_config = load_app_config(&config_path);
     let env = EnvOverrides::from_process();
-    let mut secret_store = KeychainSecretStore;
+    let secrets_dir = config_path.parent().unwrap_or(std::path::Path::new("."));
+    let mut secret_store = FileSecretStore::new(secrets_dir);
     let (runtime_config, startup_warning) =
         load_runtime_config(&cli, saved_config.clone(), &env, &secret_store);
     if let Some(warning) = &startup_warning {
@@ -329,6 +330,24 @@ fn run_loop(
                                 }
                             }
                         }
+                        InputResult::OpenSettings => {
+                            // Load the stored API key so settings UI shows it
+                            let draft = match &mut app.preview_mode {
+                                PreviewMode::Settings(d) | PreviewMode::Onboarding(d) => {
+                                    Some(d)
+                                }
+                                _ => None,
+                            };
+                            if let Some(draft) = draft {
+                                if !draft.api_key_edited {
+                                    if let Ok(Some(key)) =
+                                        secrets.load_api_key(draft.provider)
+                                    {
+                                        draft.api_key = key;
+                                    }
+                                }
+                            }
+                        }
                         InputResult::SkipOnboarding => {
                             let _ = apply_onboarding_skip(
                                 app,
@@ -399,11 +418,19 @@ fn run_loop(
         }
 
         if let Some(result_rx) = llm_result_rx.as_ref() {
-            while let Ok(results) = result_rx.try_recv() {
-                if app.scan_status == ScanStatus::Scanning && app.entries.is_empty() {
-                    buffered_llm_results.extend(results);
-                } else {
-                    apply_llm_results(app, results);
+            // Cap LLM result processing per frame to avoid blocking input
+            let mut llm_batches_this_frame = 0;
+            while llm_batches_this_frame < 3 {
+                match result_rx.try_recv() {
+                    Ok(results) => {
+                        if app.scan_status == ScanStatus::Scanning && app.entries.is_empty() {
+                            buffered_llm_results.extend(results);
+                        } else {
+                            apply_llm_results(app, results);
+                        }
+                        llm_batches_this_frame += 1;
+                    }
+                    Err(_) => break,
                 }
             }
         }
@@ -698,7 +725,7 @@ fn resolve_runtime_config(
     };
 
     Ok(RuntimeConfig {
-        scan_path: cli.path.clone().or(saved.ui.last_scan_path),
+        scan_path: cli.path.clone(),
         provider,
         show_onboarding,
         llm_enabled,
@@ -815,9 +842,9 @@ impl EnvOverrides {
 }
 
 impl RuntimeConfig {
-    fn rules_only(saved: config::AppConfig, scan_path: Option<PathBuf>) -> Self {
+    fn rules_only(_saved: config::AppConfig, scan_path: Option<PathBuf>) -> Self {
         Self {
-            scan_path: scan_path.or(saved.ui.last_scan_path),
+            scan_path,
             provider: None,
             show_onboarding: false,
             llm_enabled: false,
@@ -1297,8 +1324,33 @@ fn requeue_unknown_entries_for_visible_tree(
         return;
     }
 
-    mark_unknown_entries_as_pending(&mut app.entries);
-    for batch in batch_unknowns(collect_unknowns(&app.entries)) {
+    // Only collect unknowns from the current directory's children to avoid
+    // an O(tree_size) walk on large trees (5M+ entries). The LLM worker
+    // processes these first; deeper entries are classified on navigation.
+    let unknowns = if let Some(children) = app.children_at_path(app.columns.current_path()) {
+        let mut out = Vec::new();
+        for entry in children {
+            if entry.safety == SafetyLevel::Unknown {
+                let age_days = entry.modified.and_then(|m| {
+                    std::time::SystemTime::now()
+                        .duration_since(m)
+                        .ok()
+                        .map(|d| (d.as_secs() / 86400) as i64)
+                });
+                out.push(purifier_core::llm::UnknownEntry {
+                    path: entry.path.clone(),
+                    size: entry.total_size(purifier_core::size::SizeMode::Logical),
+                    is_dir: entry.is_dir,
+                    age_days,
+                });
+            }
+        }
+        out
+    } else {
+        collect_unknowns(&app.entries)
+    };
+
+    for batch in batch_unknowns(unknowns) {
         let _ = tx.send(batch);
     }
 }
@@ -1362,15 +1414,6 @@ fn should_mark_unknowns_pending(app: &App) -> bool {
     )
 }
 
-fn mark_unknown_entries_as_pending(entries: &mut [FileEntry]) {
-    for entry in entries {
-        if entry.safety == SafetyLevel::Unknown {
-            entry.safety_reason = "Analyzing with LLM...".to_string();
-        }
-        mark_unknown_entries_as_pending(&mut entry.children);
-    }
-}
-
 fn reset_pending_llm_labels(entries: &mut [FileEntry]) {
     for entry in entries {
         if entry.safety == SafetyLevel::Unknown && entry.safety_reason == "Analyzing with LLM..." {
@@ -1405,9 +1448,9 @@ fn update_entry_classification(entries: &mut [FileEntry], result: &LlmClassifica
             entry.safety_reason = result.reason.clone();
             return true;
         }
-
-        if update_entry_classification(&mut entry.children, result) {
-            return true;
+        // Prefix-guided descent: only recurse into dirs whose path is a prefix of the target
+        if entry.is_dir && result.path.starts_with(&entry.path) {
+            return update_entry_classification(&mut entry.children, result);
         }
     }
 
@@ -1716,7 +1759,6 @@ mod tests {
             .expect("unknown entries should be re-queued");
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].path, PathBuf::from("/scan/unknown"));
-        assert_eq!(app.entries[0].safety_reason, "Analyzing with LLM...");
     }
 
     #[test]

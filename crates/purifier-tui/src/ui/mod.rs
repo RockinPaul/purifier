@@ -1,4 +1,5 @@
 pub mod columns_view;
+pub mod disclosures;
 pub mod dir_picker;
 pub mod help_overlay;
 pub mod onboarding;

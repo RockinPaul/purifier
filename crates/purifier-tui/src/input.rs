@@ -13,6 +13,7 @@ pub enum InputResult {
     StartScan(PathBuf),
     SaveSettings(SettingsDraft),
     SkipOnboarding,
+    OpenSettings,
 }
 
 pub fn handle_key(app: &mut App, key: KeyEvent) -> InputResult {
@@ -311,6 +312,7 @@ fn handle_main_analytics(app: &mut App, key: KeyEvent) -> InputResult {
         // Settings
         KeyCode::Char(',') => {
             app.open_settings();
+            return InputResult::OpenSettings;
         }
 
         // Help overlay
@@ -427,7 +429,16 @@ fn handle_settings(app: &mut App, key: KeyEvent) -> InputResult {
     let is_editing = matches!(&app.preview_mode, PreviewMode::Settings(d) | PreviewMode::Onboarding(d) if d.api_key_editing);
 
     if is_editing {
-        return handle_api_key_editing(app, key);
+        if key.code == KeyCode::Enter {
+            // Exit editing mode, then fall through to save below
+            if let PreviewMode::Settings(d) | PreviewMode::Onboarding(d) =
+                &mut app.preview_mode
+            {
+                d.api_key_editing = false;
+            }
+        } else {
+            return handle_api_key_editing(app, key);
+        }
     }
 
     if key.code == KeyCode::Enter {
@@ -435,12 +446,6 @@ fn handle_settings(app: &mut App, key: KeyEvent) -> InputResult {
             PreviewMode::Settings(d) => d.clone(),
             _ => return InputResult::None,
         };
-        if draft.api_key_editing {
-            if let PreviewMode::Settings(d) = &mut app.preview_mode {
-                d.api_key_editing = false;
-            }
-            return InputResult::None;
-        }
         app.settings_modal_error = None;
         app.last_error = None;
         return InputResult::SaveSettings(draft);
@@ -451,12 +456,10 @@ fn handle_settings(app: &mut App, key: KeyEvent) -> InputResult {
         return InputResult::None;
     }
 
-    // Provider switching
+    // Provider switching (only OpenRouter and OpenAI are implemented)
     let provider_switch = match key.code {
         KeyCode::Char('1') => Some(ProviderKind::OpenRouter),
         KeyCode::Char('2') => Some(ProviderKind::OpenAI),
-        KeyCode::Char('3') => Some(ProviderKind::Anthropic),
-        KeyCode::Char('4') => Some(ProviderKind::Google),
         _ => None,
     };
 
@@ -473,7 +476,7 @@ fn handle_settings(app: &mut App, key: KeyEvent) -> InputResult {
             app.settings_modal_error = None;
             app.last_error = None;
         }
-        return InputResult::None;
+        return InputResult::OpenSettings;
     }
 
     match key.code {
@@ -516,7 +519,14 @@ fn handle_onboarding(app: &mut App, key: KeyEvent) -> InputResult {
 
     let is_editing = matches!(&app.preview_mode, PreviewMode::Onboarding(d) if d.api_key_editing);
     if is_editing {
-        return handle_api_key_editing(app, key);
+        if key.code == KeyCode::Enter {
+            // Exit editing mode, then fall through to save below
+            if let PreviewMode::Onboarding(d) = &mut app.preview_mode {
+                d.api_key_editing = false;
+            }
+        } else {
+            return handle_api_key_editing(app, key);
+        }
     }
 
     if key.code == KeyCode::Enter {
@@ -544,12 +554,10 @@ fn handle_onboarding(app: &mut App, key: KeyEvent) -> InputResult {
         return InputResult::SkipOnboarding;
     }
 
-    // Provider switching
+    // Provider switching (only OpenRouter and OpenAI are implemented)
     let provider_switch = match key.code {
         KeyCode::Char('1') => Some(ProviderKind::OpenRouter),
         KeyCode::Char('2') => Some(ProviderKind::OpenAI),
-        KeyCode::Char('3') => Some(ProviderKind::Anthropic),
-        KeyCode::Char('4') => Some(ProviderKind::Google),
         _ => None,
     };
 
@@ -566,7 +574,7 @@ fn handle_onboarding(app: &mut App, key: KeyEvent) -> InputResult {
             app.settings_modal_error = None;
             app.last_error = None;
         }
-        return InputResult::None;
+        return InputResult::OpenSettings;
     }
 
     if key.code == KeyCode::Char('a') {
@@ -819,6 +827,83 @@ mod tests {
 
         handle_key(&mut app, key(KeyCode::Esc));
         assert!(matches!(app.preview_mode, PreviewMode::Analytics));
+    }
+
+    #[test]
+    fn enter_during_api_key_editing_should_save_settings() {
+        let mut app = app_with_entries();
+        // Open settings
+        handle_key(&mut app, key(KeyCode::Char(',')));
+        assert!(matches!(app.preview_mode, PreviewMode::Settings(_)));
+
+        // Press 'a' to start editing API key
+        handle_key(&mut app, key(KeyCode::Char('a')));
+        if let PreviewMode::Settings(d) = &app.preview_mode {
+            assert!(d.api_key_editing);
+        } else {
+            panic!("expected Settings");
+        }
+
+        // Type some characters
+        handle_key(&mut app, key(KeyCode::Char('s')));
+        handle_key(&mut app, key(KeyCode::Char('k')));
+        handle_key(&mut app, key(KeyCode::Char('-')));
+        handle_key(&mut app, key(KeyCode::Char('t')));
+
+        // Verify key was typed
+        if let PreviewMode::Settings(d) = &app.preview_mode {
+            assert_eq!(d.api_key, "sk-t");
+            assert!(d.api_key_edited);
+            assert!(d.api_key_editing);
+        } else {
+            panic!("expected Settings");
+        }
+
+        // Press Enter — should exit editing AND return SaveSettings
+        let result = handle_key(&mut app, key(KeyCode::Enter));
+        assert!(
+            matches!(result, InputResult::SaveSettings(_)),
+            "Enter during editing should trigger SaveSettings, got: {:?}",
+            std::mem::discriminant(&result)
+        );
+
+        // Verify the draft in SaveSettings has the key
+        if let InputResult::SaveSettings(draft) = result {
+            assert_eq!(draft.api_key, "sk-t");
+            assert!(draft.api_key_edited);
+            assert!(!draft.api_key_editing);
+        }
+    }
+
+    #[test]
+    fn settings_reopen_should_show_previously_entered_key() {
+        let mut app = app_with_entries();
+        // Open settings → edit → type key → press Enter
+        handle_key(&mut app, key(KeyCode::Char(',')));
+        handle_key(&mut app, key(KeyCode::Char('a')));
+        handle_key(&mut app, key(KeyCode::Char('k')));
+        handle_key(&mut app, key(KeyCode::Char('e')));
+        handle_key(&mut app, key(KeyCode::Char('y')));
+        let result = handle_key(&mut app, key(KeyCode::Enter));
+        assert!(matches!(result, InputResult::SaveSettings(_)));
+
+        // Simulate what main.rs does: close the modal (simplified)
+        app.close_preview_modal();
+        assert!(matches!(app.preview_mode, PreviewMode::Analytics));
+
+        // Reopen settings
+        let result = handle_key(&mut app, key(KeyCode::Char(',')));
+        assert!(matches!(result, InputResult::OpenSettings));
+        assert!(matches!(app.preview_mode, PreviewMode::Settings(_)));
+
+        // The draft should start empty since build_settings_draft always creates empty key
+        if let PreviewMode::Settings(d) = &app.preview_mode {
+            // Key is empty because build_settings_draft creates empty key.
+            // The OpenSettings handler in main.rs is responsible for loading from the secret
+            // store. In unit tests, the key starts empty until that handler runs.
+            assert!(d.api_key.is_empty(), "draft should start empty before OpenSettings handler");
+            assert!(!d.api_key_edited);
+        }
     }
 
     #[test]

@@ -7,13 +7,14 @@ use ratatui::Frame;
 use purifier_core::provider::ProviderKind;
 
 use crate::app::{App, PreviewMode};
+use crate::ui::disclosures::current_storage_and_privacy_lines;
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
 
     // Centered card
     let card_width = 60u16.min(area.width.saturating_sub(4));
-    let card_height = 18u16.min(area.height.saturating_sub(4));
+    let card_height = 22u16.min(area.height.saturating_sub(4));
     let card_area = centered_rect(area, card_width, card_height);
 
     frame.render_widget(Clear, card_area);
@@ -117,6 +118,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
     lines.push(Line::from(key_display));
     lines.push(Line::from(""));
 
+    lines.extend(current_storage_and_privacy_lines());
+    lines.push(Line::from(""));
+
     // Error message
     if let Some(error) = &app.settings_modal_error {
         lines.push(Line::from(Span::styled(
@@ -152,4 +156,62 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
     let [v_area] = vertical.areas(area);
     let [h_area] = horizontal.areas(v_area);
     h_area
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::{AppScreen, SettingsDraft};
+    use crate::config::AppConfig;
+    use purifier_core::size::SizeMode;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::Terminal;
+
+    fn render_to_buffer(app: &App, width: u16, height: u16) -> Buffer {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal should be created");
+        terminal.draw(|frame| draw(frame, app)).expect("should render");
+        terminal.backend().buffer().clone()
+    }
+
+    fn buffer_text(buffer: &Buffer) -> String {
+        let mut text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    #[test]
+    fn onboarding_should_explain_plaintext_storage_and_llm_path_sharing() {
+        let mut app = App::new(None, true, AppConfig::default());
+        app.screen = AppScreen::Onboarding;
+        app.preview_mode = PreviewMode::Onboarding(SettingsDraft {
+            provider: ProviderKind::OpenRouter,
+            api_key: String::new(),
+            api_key_edited: false,
+            api_key_editing: false,
+            model: String::new(),
+            base_url: String::new(),
+            llm_enabled: true,
+            size_mode: SizeMode::Physical,
+            selected_scan_profile: None,
+        });
+
+        let buffer = render_to_buffer(&app, 80, 24);
+        let text = buffer_text(&buffer);
+
+        assert!(
+            text.contains("secrets.toml"),
+            "onboarding should mention plaintext key storage: {text}"
+        );
+        assert!(
+            text.contains("exact path"),
+            "onboarding should mention exact path disclosure: {text}"
+        );
+    }
 }

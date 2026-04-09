@@ -1,0 +1,51 @@
+name: Bug report
+description: Report incorrect behavior, regressions, crashes, or deletion-safety problems.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: Describe the problem in one or two sentences.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Provide exact steps, including CLI flags, provider choice, and sanitized paths.
+      placeholder: |
+        1. Run `purifier ~/Library`
+        2. Open settings with `,`
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: dropdown
+    id: llm_mode
+    attributes:
+      label: Classification mode
+      options:
+        - Rules only
+        - LLM enabled
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: verification
+    attributes:
+      label: Extra context
+      description: Add screenshots, logs, sanitized paths, macOS version, and whether deletion was involved.

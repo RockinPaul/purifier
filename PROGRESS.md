@@ -11,8 +11,9 @@ Current state:
 - Live runtime-wired providers are `OpenRouter` and `OpenAI`.
 - `Anthropic` and `Google` settings can be persisted, but runtime support is not wired yet.
 - `Ollama` is intentionally disabled for now. The code keeps TODO markers for restoring it later.
-- User preferences are persisted in `~/.config/purifier/config.toml`.
-- Provider secrets are stored in macOS Keychain.
+- User preferences are persisted in the OS config directory, for example `~/Library/Application Support/purifier/config.toml` on macOS.
+- If saved from settings, provider API keys are stored in neighboring plaintext `secrets.toml` with restrictive Unix file permissions.
+- Unknown-path LLM requests can send exact path strings plus kind, size, and age metadata to the configured remote provider.
 - The TUI has first-launch onboarding and settings in the preview pane.
 - Size mode is persisted and defaults to `Physical`.
 - Built-in scan profiles are available by default: `Full scan`, `Fast developer scan`.

@@ -1,3 +1,12 @@
 /target
-.superpowers/
-.worktrees/
+/.superpowers/
+/.worktrees/
+/.claude/
+/skills-lock.json
+/docs/worktree-*.diff
+/docs/superpowers/
+/docs/plans/
+/docs/lagging_issue_explanation.md
+/lagging_issue_explanation.md
+/plan_*.md
+.DS_Store

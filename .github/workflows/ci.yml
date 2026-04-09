@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo artifacts
+        uses: swatinem/rust-cache@v2
+
+      - name: Test purifier-core
+        run: cargo test -p purifier-core
+
+      - name: Test purifier-tui
+        run: cargo test -p purifier-tui
+
+      - name: Clippy
+        run: cargo clippy -p purifier-core -p purifier-tui --all-targets -- -D warnings

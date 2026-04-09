@@ -1,0 +1,37 @@
+name: Docs or rules mismatch
+description: Report documentation drift, misleading copy, or a missing safety rule.
+title: "[Docs/Rules]: "
+labels:
+  - documentation
+body:
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Type
+      options:
+        - Documentation mismatch
+        - Missing safety rule
+        - Misleading safety reason
+        - Privacy disclosure gap
+    validations:
+      required: true
+  - type: textarea
+    id: location
+    attributes:
+      label: Affected file or screen
+      description: Point to the doc path, UI surface, or rules file involved.
+    validations:
+      required: true
+  - type: textarea
+    id: current
+    attributes:
+      label: What is wrong today
+    validations:
+      required: true
+  - type: textarea
+    id: suggested
+    attributes:
+      label: Suggested correction
+      description: Include sanitized example paths if relevant.
+    validations:
+      required: true
