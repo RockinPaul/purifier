@@ -4,6 +4,13 @@ title: "[Docs/Rules]: "
 labels:
   - documentation
 body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: Describe the mismatch or missing rule in a sentence or two.
+    validations:
+      required: true
   - type: dropdown
     id: kind
     attributes:
@@ -13,25 +20,17 @@ body:
         - Missing safety rule
         - Misleading safety reason
         - Privacy disclosure gap
-    validations:
-      required: true
   - type: textarea
     id: location
     attributes:
       label: Affected file or screen
-      description: Point to the doc path, UI surface, or rules file involved.
-    validations:
-      required: true
+      description: Point to the doc path, UI surface, or rules file involved if you know it.
   - type: textarea
     id: current
     attributes:
       label: What is wrong today
-    validations:
-      required: true
   - type: textarea
     id: suggested
     attributes:
       label: Suggested correction
       description: Include sanitized example paths if relevant.
-    validations:
-      required: true

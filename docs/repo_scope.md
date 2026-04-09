@@ -10,6 +10,7 @@ This file records what should stay in the public Purifier repository and what sh
   - `README.md`
   - `PROGRESS.md`
   - `AGENTS.md`
+  - `CONTRIBUTING.md`
   - `LICENSE`
   - `.github/**`
   - `docs/ISSUES.md`

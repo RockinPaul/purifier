@@ -14,26 +14,20 @@ body:
   - type: textarea
     id: steps
     attributes:
-      label: Steps to reproduce
-      description: Provide exact steps, including CLI flags, provider choice, and sanitized paths.
+      label: What were you doing?
+      description: Reproduction steps help, but a rough flow is fine too.
       placeholder: |
         1. Run `purifier ~/Library`
         2. Open settings with `,`
         3. ...
-    validations:
-      required: true
   - type: textarea
     id: expected
     attributes:
       label: Expected behavior
-    validations:
-      required: true
   - type: textarea
     id: actual
     attributes:
       label: Actual behavior
-    validations:
-      required: true
   - type: dropdown
     id: llm_mode
     attributes:
@@ -42,10 +36,8 @@ body:
         - Rules only
         - LLM enabled
         - Not sure
-    validations:
-      required: true
   - type: textarea
     id: verification
     attributes:
       label: Extra context
-      description: Add screenshots, logs, sanitized paths, macOS version, and whether deletion was involved.
+      description: Add screenshots, logs, sanitized paths, macOS version, or whether deletion was involved if helpful.

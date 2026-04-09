@@ -31,11 +31,12 @@ This document now reflects the current working tree state rather than the origin
 
 Added repository surfaces:
 
-- [CONTRIBUTING.md](../.github/CONTRIBUTING.md)
+- [CONTRIBUTING.md](../CONTRIBUTING.md)
 - [SECURITY.md](../.github/SECURITY.md)
 - [CODE_OF_CONDUCT.md](../.github/CODE_OF_CONDUCT.md)
 - [bug_report.yml](../.github/ISSUE_TEMPLATE/bug_report.yml)
 - [docs_or_rules_mismatch.yml](../.github/ISSUE_TEMPLATE/docs_or_rules_mismatch.yml)
+- [improvement_request.yml](../.github/ISSUE_TEMPLATE/improvement_request.yml)
 - [PULL_REQUEST_TEMPLATE.md](../.github/PULL_REQUEST_TEMPLATE.md)
 
 ## Remaining Work Before Public Launch
